@@ -3,26 +3,31 @@
 //! Accepts mail over plaintext, STARTTLS and implicit-TLS SMTP into per-user
 //! in-memory mailboxes. Messages expire after a configurable retention period
 //! and are never delivered, relayed or written to disk.
+//!
+//! Apart from the data directory and the web UI's bind address, everything is
+//! configured from the admin UI at `/admin/settings` and stored in SQLite.
 
+mod acme;
 mod config;
 mod db;
+mod listeners;
 mod mailstore;
+mod settings;
 mod smtp;
 mod state;
 mod tls;
 mod web;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rand::distributions::{Alphanumeric, DistString};
 
-use crate::config::{now_unix, Config};
+use crate::config::BootConfig;
 use crate::db::Db;
-use crate::mailstore::MailStore;
+use crate::settings::Settings;
 use crate::state::AppState;
+use crate::tls::CertStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,19 +42,37 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let cfg = Config::from_env();
-    std::fs::create_dir_all(&cfg.data_dir)
-        .with_context(|| format!("cannot create data dir {}", cfg.data_dir.display()))?;
+    let boot = BootConfig::from_env();
+    std::fs::create_dir_all(&boot.data_dir)
+        .with_context(|| format!("cannot create data dir {}", boot.data_dir.display()))?;
 
-    let db = Db::open(&cfg.data_dir.join("smtpvoid.db")).context("opening database")?;
-    let mail = MailStore::new(Duration::from_secs(cfg.retention_secs), cfg.mailbox_cap);
-    let tls = tls::load_or_generate(&cfg.data_dir, &cfg.hostname).context("preparing TLS")?;
+    let db = Db::open(&boot.data_dir.join("smtpvoid.db")).context("opening database")?;
+
+    // Settings live in the database. On first run we write the defaults out so
+    // the admin form shows explicit rows rather than implicit fallbacks.
+    let stored = db.load_settings().context("reading settings")?;
+    let first_run = stored.is_empty();
+    let settings = Settings::from_pairs(&stored);
+    if first_run {
+        db.save_settings(&settings.to_pairs()).context("seeding default settings")?;
+        tracing::info!("no settings stored yet - seeded defaults, edit them at /admin/settings");
+    }
+    if let Err(e) = settings.validate() {
+        // Not fatal: the admin needs the UI up in order to fix it.
+        tracing::warn!("stored settings are questionable ({e}); fix them at /admin/settings");
+    }
+
+    let certs = CertStore::new(&boot.data_dir).context("preparing the TLS directory")?;
+    certs
+        .load_or_generate(&settings.cert_names())
+        .context("preparing TLS")?;
+    let tls = tls::server_config(certs.clone());
 
     // Admin bootstrap: keep a setup token around until an admin account exists.
     let setup_token = if db.admin_exists()? {
         None
     } else {
-        let token_file = cfg.data_dir.join("admin_setup_token");
+        let token_file = boot.data_dir.join("admin_setup_token");
         let token = match std::fs::read_to_string(&token_file) {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             _ => {
@@ -64,26 +87,21 @@ async fn main() -> Result<()> {
         Some(token)
     };
 
-    let state = Arc::new(AppState {
-        cfg: cfg.clone(),
-        db,
-        mail,
-        tls,
-        sessions: Mutex::new(HashMap::new()),
-        reveals: Mutex::new(HashMap::new()),
-        setup_token: Mutex::new(setup_token),
-        reg_throttle: Mutex::new(HashMap::new()),
-        started_at: now_unix(),
-    });
+    let state = Arc::new(AppState::new(boot, settings, db, certs, tls, setup_token));
 
     smtp::spawn_sweeper(state.clone());
-    smtp::run(state.clone()).await.context("starting SMTP listeners")?;
+    acme::spawn_manager(state.clone());
 
+    for problem in listeners::reconcile(&state).await {
+        tracing::error!("{problem} - fix it at /admin/settings");
+    }
+
+    let settings = state.settings();
     tracing::info!(
         "SMTPVoid up: retention {}s, mailbox cap {}, max message size {} bytes",
-        cfg.retention_secs,
-        cfg.mailbox_cap,
-        cfg.max_message_size
+        settings.retention_secs,
+        settings.mailbox_cap,
+        settings.max_message_size
     );
 
     web::serve(state).await.context("running web server")

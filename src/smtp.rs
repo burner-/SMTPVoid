@@ -18,6 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::config::now_unix;
 use crate::db::CredAuth;
 use crate::mailstore::{ConnKind, ConnectionInfo};
+use crate::settings::Settings;
 use crate::state::AppState;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -95,6 +96,9 @@ struct AuthedAs {
 
 struct Session {
     state: Arc<AppState>,
+    /// Settings snapshot taken when the connection was accepted, so a mid-session
+    /// admin change cannot move the goalposts inside one transaction.
+    settings: Arc<Settings>,
     io: LineStream,
     peer: String,
     /// Offered on the plaintext listener until upgraded.
@@ -112,53 +116,45 @@ struct Session {
     messages: u32,
 }
 
-/// Spawn both SMTP listeners.
-pub async fn run(state: Arc<AppState>) -> Result<()> {
-    let plain = TcpListener::bind(&state.cfg.smtp_addr).await?;
-    let tls = TcpListener::bind(&state.cfg.smtps_addr).await?;
-    tracing::info!("SMTP (plaintext + STARTTLS) listening on {}", state.cfg.smtp_addr);
-    tracing::info!("SMTPS (implicit TLS) listening on {}", state.cfg.smtps_addr);
-
-    let s1 = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match plain.accept().await {
-                Ok((stream, peer)) => {
-                    let state = s1.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_plain(state, stream, peer.to_string()).await {
-                            tracing::debug!("smtp session {peer}: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!("smtp accept error: {e}"),
+/// Accept loop for the plaintext listener. Runs until the task is aborted,
+/// which is how [`crate::listeners`] moves the listener to a new address.
+pub async fn accept_plain(state: Arc<AppState>, listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_plain(state, stream, peer.to_string()).await {
+                        tracing::debug!("smtp session {peer}: {e:#}");
+                    }
+                });
             }
+            Err(e) => tracing::warn!("smtp accept error: {e}"),
         }
-    });
+    }
+}
 
-    let s2 = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match tls.accept().await {
-                Ok((stream, peer)) => {
-                    let state = s2.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_implicit_tls(state, stream, peer.to_string()).await {
-                            tracing::debug!("smtps session {peer}: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!("smtps accept error: {e}"),
+/// Accept loop for the implicit-TLS (SMTPS) listener.
+pub async fn accept_implicit_tls(state: Arc<AppState>, listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_implicit_tls(state, stream, peer.to_string()).await {
+                        tracing::debug!("smtps session {peer}: {e:#}");
+                    }
+                });
             }
+            Err(e) => tracing::warn!("smtps accept error: {e}"),
         }
-    });
-
-    Ok(())
+    }
 }
 
 async fn handle_plain(state: Arc<AppState>, stream: TcpStream, peer: String) -> Result<()> {
     let acceptor = TlsAcceptor::from(state.tls.clone());
     let session = Session {
+        settings: state.settings(),
         state,
         io: LineStream::new(Box::new(stream)),
         peer,
@@ -183,6 +179,7 @@ async fn handle_implicit_tls(state: Arc<AppState>, stream: TcpStream, peer: Stri
     let tls_stream = tokio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await??;
     let (version, cipher) = tls_params(tls_stream.get_ref().1);
     let session = Session {
+        settings: state.settings(),
         state,
         io: LineStream::new(Box::new(tls_stream)),
         peer,
@@ -212,7 +209,7 @@ fn tls_params(conn: &rustls::ServerConnection) -> (Option<String>, Option<String
 
 impl Session {
     async fn run(mut self) -> Result<()> {
-        let hostname = self.state.cfg.hostname.clone();
+        let hostname = self.settings.hostname.clone();
         self.io
             .write_line(&format!(
                 "220 {hostname} ESMTP SMTPVoid ready - test sink, nothing is ever delivered"
@@ -294,14 +291,14 @@ impl Session {
         self.helo = Some(arg.to_string());
         self.esmtp = esmtp;
         self.reset_transaction();
-        let hostname = &self.state.cfg.hostname;
+        let hostname = self.settings.hostname.clone();
         if !esmtp {
             return self.io.write_line(&format!("250 {hostname} greets {arg}")).await;
         }
         self.io.write_line(&format!("250-{hostname} greets {arg}")).await?;
         self.io.write_line("250-8BITMIME").await?;
         self.io
-            .write_line(&format!("250-SIZE {}", self.state.cfg.max_message_size))
+            .write_line(&format!("250-SIZE {}", self.settings.max_message_size))
             .await?;
         if self.starttls.is_some() {
             self.io.write_line("250-STARTTLS").await?;
@@ -479,7 +476,7 @@ impl Session {
         for param in rest.split_whitespace().skip_while(|p| !p.to_uppercase().starts_with("SIZE=")) {
             if let Some(v) = param.to_uppercase().strip_prefix("SIZE=") {
                 if let Ok(size) = v.parse::<usize>() {
-                    if size > self.state.cfg.max_message_size {
+                    if size > self.settings.max_message_size {
                         return self
                             .syntax_error("552 5.3.4 Message size exceeds fixed maximum")
                             .await;
@@ -523,7 +520,7 @@ impl Session {
             .write_line("354 End data with <CR><LF>.<CR><LF>")
             .await?;
 
-        let max = self.state.cfg.max_message_size;
+        let max = self.settings.max_message_size;
         let mut body: Vec<u8> = Vec::new();
         let mut oversize = false;
         loop {

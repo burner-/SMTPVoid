@@ -12,12 +12,15 @@ Wants=network-online.target
 User=smtpvoid
 Group=smtpvoid
 ExecStart=/usr/local/bin/smtpvoid
+# These two are the only environment settings; everything else (hostname,
+# listener addresses, retention, Let's Encrypt) is configured at /admin/settings.
 Environment=SMTPVOID_DATA_DIR=/var/lib/smtpvoid
-Environment=SMTPVOID_HOSTNAME=smtp.example.test
-# Uncomment to use privileged standard ports directly:
-#Environment=SMTPVOID_SMTP_ADDR=0.0.0.0:587
-#Environment=SMTPVOID_SMTPS_ADDR=0.0.0.0:465
-#AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=SMTPVOID_HTTP_ADDR=0.0.0.0:8080
+
+# Needed to bind the privileged ports the admin UI can be pointed at:
+# 25/587 (SMTP), 465 (SMTPS), 80 (ACME HTTP-01 challenge), 443 (HTTPS UI).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Hardening
 NoNewPrivileges=true

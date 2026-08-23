@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -94,6 +95,10 @@ CREATE TABLE IF NOT EXISTS global_stats (
     key TEXT PRIMARY KEY,
     value INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 impl Db {
@@ -107,6 +112,37 @@ impl Db {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("db mutex poisoned")
+    }
+
+    // ---- settings ----
+
+    /// Read every stored settings row. Missing keys are the caller's problem
+    /// (see [`crate::settings::Settings::from_pairs`], which fills in defaults).
+    pub fn load_settings(&self) -> Result<HashMap<String, String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    /// Persist settings rows atomically: either the whole set lands or none does.
+    pub fn save_settings(&self, pairs: &[(&str, String)]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (key, value) in pairs {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ---- users ----

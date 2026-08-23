@@ -2,6 +2,7 @@
 //! the virtual mailbox, admin statistics and first-run admin setup.
 
 mod html;
+mod tls_listener;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,13 +16,17 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::{Form, Router};
 use rand::distributions::{Alphanumeric, DistString};
 use serde::Deserialize;
+use tokio::net::TcpListener;
 
 use crate::config::now_unix;
 use crate::db::User;
+use crate::settings::{parse_domains, Settings};
 use crate::state::{AppState, WebSession, SESSION_TTL_SECS};
+use crate::web::tls_listener::TlsListener;
 
 const SESSION_COOKIE: &str = "svsession";
 
@@ -106,7 +111,7 @@ fn new_session(state: &AppState, user_id: i64) -> (String, String) {
             token.clone(),
             WebSession { user_id, expires_at: now_unix() + SESSION_TTL_SECS },
         );
-    let secure = if state.cfg.cookie_secure { "; Secure" } else { "" };
+    let secure = if state.settings().cookie_secure { "; Secure" } else { "" };
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECS}{secure}"
     );
@@ -124,8 +129,9 @@ fn flash<'a>(q: &'a HashMap<String, String>) -> (Option<&'a str>, Option<&'a str
 
 // ---- routing ----
 
-pub async fn serve(state: Arc<AppState>) -> Result<()> {
-    let app = Router::new()
+/// The full application router, shared by the HTTP and HTTPS listeners.
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/register", get(register_form).post(register))
         .route("/login", get(login_form).post(login))
@@ -140,21 +146,46 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
         .route("/setup", get(setup_form).post(setup_submit))
         .route("/admin", get(admin_view))
         .route("/admin/users/{id}/delete", post(admin_delete_user))
-        .with_state(state.clone());
+        .route("/admin/settings", get(settings_view).post(settings_save))
+        .route("/admin/tls/renew", post(tls_renew))
+        .route("/admin/tls/self-signed", post(tls_self_signed))
+        .with_state(state.clone())
+        // Also answer ACME challenges here, for deployments that proxy
+        // /.well-known/ to the web UI instead of exposing the port-80 listener.
+        .merge(crate::acme::challenge_router(state))
+}
 
-    let listener = tokio::net::TcpListener::bind(&state.cfg.http_addr).await?;
-    tracing::info!("web UI listening on http://{}", state.cfg.http_addr);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+/// The plaintext web UI. Bound once from [`crate::config::BootConfig`] and
+/// never moved, so a bad setting cannot cut off access to the settings form.
+pub async fn serve(state: Arc<AppState>) -> Result<()> {
+    let listener = TcpListener::bind(&state.boot.http_addr).await?;
+    tracing::info!("web UI listening on http://{}", state.boot.http_addr);
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The optional HTTPS web UI, using the same certificate as the SMTP listeners.
+pub async fn serve_https(state: Arc<AppState>, listener: TcpListener) -> Result<()> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(state.tls.clone());
+    // The no-op `tap_io` is load-bearing: axum only implements `Connected`
+    // (which is what makes `ConnectInfo<SocketAddr>` work) for `TcpListener`
+    // and for any `TapIo` wrapper, not for arbitrary custom listeners.
+    let listener = TlsListener::new(listener, acceptor)?.tap_io(|_| {});
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
 // ---- public pages ----
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let settings = state.settings();
     let body = html::index_page(
-        &state.cfg.smtp_addr,
-        &state.cfg.smtps_addr,
-        state.cfg.retention_secs as i64,
+        &settings.smtp_addr,
+        &settings.smtps_addr,
+        settings.retention_secs as i64,
+        settings.registration_open,
     );
     let nav = match current_user(&state, &headers) {
         Some(u) => html::layout("SMTP testing sink", html::Nav::User(&u), None, None, &body),
@@ -163,7 +194,13 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     Html(nav).into_response()
 }
 
-async fn register_form(Query(q): Query<HashMap<String, String>>) -> Response {
+async fn register_form(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.settings().registration_open {
+        return redirect_err("/login", "Registration is closed on this server");
+    }
     let (ok, err) = flash(&q);
     let body = html::auth_page("Create account", "/register", "Create account", "");
     Html(html::layout("Create account", html::Nav::Anonymous, ok, err, &body)).into_response()
@@ -180,6 +217,9 @@ async fn register(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Form(form): Form<AuthForm>,
 ) -> Response {
+    if !state.settings().registration_open {
+        return redirect_err("/login", "Registration is closed on this server");
+    }
     let username = form.username.trim().to_string();
     if !valid_username(&username) {
         return redirect_err(
@@ -271,15 +311,16 @@ async fn dashboard(
         state.reveals.lock().expect("reveals mutex poisoned").remove(&t)
     });
     let (ok, err) = flash(&q);
+    let settings = state.settings();
     let body = html::dashboard_page(
         &user,
         &creds,
         &emails,
         reveal,
-        &state.cfg.smtp_addr,
-        &state.cfg.smtps_addr,
-        &state.cfg.hostname,
-        state.cfg.retention_secs as i64,
+        &settings.smtp_addr,
+        &settings.smtps_addr,
+        &settings.hostname,
+        settings.retention_secs as i64,
     );
     Html(html::layout("Dashboard", html::Nav::User(&user), ok, err, &body)).into_response()
 }
@@ -290,7 +331,7 @@ async fn cred_create(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         None => return Redirect::to("/login").into_response(),
     };
     let count = state.db.count_credentials(user.id).unwrap_or(0);
-    if count >= state.cfg.max_credentials_per_user {
+    if count >= state.settings().max_credentials_per_user {
         return redirect_err("/dashboard", "Credential limit reached");
     }
     let (cred_user, cred_pass) = {
@@ -449,7 +490,7 @@ async fn setup_submit(State(state): State<Arc<AppState>>, Form(form): Form<Setup
     match state.db.create_user(&username, &hash, true) {
         Ok(_) => {
             *state.setup_token.lock().expect("setup mutex poisoned") = None;
-            let token_file = state.cfg.data_dir.join("admin_setup_token");
+            let token_file = state.boot.data_dir.join("admin_setup_token");
             if let Err(e) = std::fs::remove_file(&token_file) {
                 tracing::warn!("could not remove setup token file: {e}");
             }
@@ -462,15 +503,26 @@ async fn setup_submit(State(state): State<Arc<AppState>>, Form(form): Form<Setup
 
 // ---- admin pages ----
 
+/// Resolve the signed-in admin, or the response to send instead.
+// The `Err` variant is a whole `Response`, which clippy considers large. Boxing
+// it would only add an allocation on a path that returns the value immediately.
+#[allow(clippy::result_large_err)]
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
+    match current_user(state, headers) {
+        Some(u) if u.is_admin => Ok(u),
+        Some(_) => Err((StatusCode::FORBIDDEN, "admin only").into_response()),
+        None => Err(Redirect::to("/login").into_response()),
+    }
+}
+
 async fn admin_view(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let user = match current_user(&state, &headers) {
-        Some(u) if u.is_admin => u,
-        Some(_) => return (StatusCode::FORBIDDEN, "admin only").into_response(),
-        None => return Redirect::to("/login").into_response(),
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
     };
     let stats = state.db.global_stats().unwrap_or_default();
     let users = state.db.list_users_admin().unwrap_or_default();
@@ -481,7 +533,7 @@ async fn admin_view(
         &users,
         &usage,
         state.started_at,
-        state.cfg.retention_secs as i64,
+        state.settings().retention_secs as i64,
     );
     Html(html::layout("Admin", html::Nav::User(&user), ok, err, &body)).into_response()
 }
@@ -491,10 +543,9 @@ async fn admin_delete_user(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let user = match current_user(&state, &headers) {
-        Some(u) if u.is_admin => u,
-        Some(_) => return (StatusCode::FORBIDDEN, "admin only").into_response(),
-        None => return Redirect::to("/login").into_response(),
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
     };
     let target = match state.db.get_user_by_id(id) {
         Ok(Some(t)) => t,
@@ -515,4 +566,197 @@ async fn admin_delete_user(
         .retain(|_, s| s.user_id != id);
     tracing::info!("admin {} deleted user {} ({})", user.username, target.username, id);
     redirect_ok("/admin", "User deleted")
+}
+
+// ---- admin settings ----
+
+async fn settings_view(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let (ok, err) = flash(&q);
+    let body = html::settings_page(
+        &state.settings(),
+        &state.boot,
+        state.certs.info(),
+        &state.acme.status(),
+        &state.listeners.active().await,
+    );
+    Html(html::layout("Settings", html::Nav::User(&user), ok, err, &body)).into_response()
+}
+
+/// Every field arrives as a string; unchecked checkboxes are simply absent.
+#[derive(Deserialize)]
+struct SettingsForm {
+    hostname: String,
+    smtp_addr: String,
+    smtps_addr: String,
+    https_addr: String,
+    retention_secs: String,
+    mailbox_cap: String,
+    max_message_size: String,
+    max_credentials_per_user: String,
+    cookie_secure: Option<String>,
+    registration_open: Option<String>,
+    registrations_per_hour: String,
+    acme_enabled: Option<String>,
+    acme_directory: String,
+    acme_contact_email: String,
+    acme_domains: String,
+    acme_http_addr: String,
+    acme_tos_agreed: Option<String>,
+    acme_renew_before_days: String,
+}
+
+fn parse_num<T: std::str::FromStr>(label: &str, raw: &str) -> Result<T, String> {
+    raw.trim()
+        .parse::<T>()
+        .map_err(|_| format!("{label} must be a whole number"))
+}
+
+impl SettingsForm {
+    fn into_settings(self) -> Result<Settings, String> {
+        Ok(Settings {
+            hostname: self.hostname.trim().to_ascii_lowercase(),
+            smtp_addr: self.smtp_addr.trim().to_string(),
+            smtps_addr: self.smtps_addr.trim().to_string(),
+            https_addr: self.https_addr.trim().to_string(),
+            retention_secs: parse_num("Retention", &self.retention_secs)?,
+            mailbox_cap: parse_num("Mailbox capacity", &self.mailbox_cap)?,
+            max_message_size: parse_num("Max message size", &self.max_message_size)?,
+            max_credentials_per_user: parse_num(
+                "Credentials per user",
+                &self.max_credentials_per_user,
+            )?,
+            cookie_secure: self.cookie_secure.is_some(),
+            registration_open: self.registration_open.is_some(),
+            registrations_per_hour: parse_num(
+                "Registrations per hour",
+                &self.registrations_per_hour,
+            )?,
+            acme_enabled: self.acme_enabled.is_some(),
+            acme_directory: self.acme_directory.trim().to_string(),
+            acme_contact_email: self.acme_contact_email.trim().to_string(),
+            acme_domains: parse_domains(&self.acme_domains),
+            acme_http_addr: self.acme_http_addr.trim().to_string(),
+            acme_tos_agreed: self.acme_tos_agreed.is_some(),
+            acme_renew_before_days: parse_num("Renewal window", &self.acme_renew_before_days)?,
+        })
+    }
+}
+
+async fn settings_save(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SettingsForm>,
+) -> Response {
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+
+    let new = match form.into_settings() {
+        Ok(s) => s,
+        Err(e) => return redirect_err("/admin/settings", &e),
+    };
+    if let Err(e) = new.validate() {
+        return redirect_err("/admin/settings", &e);
+    }
+
+    let old = state.settings();
+    if *old == new {
+        return redirect_ok("/admin/settings", "No changes to save");
+    }
+    if let Err(e) = state.db.save_settings(&new.to_pairs()) {
+        tracing::error!("saving settings failed: {e:#}");
+        return redirect_err("/admin/settings", "Could not write the settings to the database");
+    }
+    state.set_settings(new.clone());
+    tracing::info!("admin {} updated the settings", user.username);
+
+    let mut notes: Vec<String> = Vec::new();
+
+    // A self-signed certificate names the SMTP hostname, so it has to be
+    // reissued when that changes. A real certificate is left alone.
+    let self_signed = state
+        .certs
+        .info()
+        .is_some_and(|i| i.source == crate::tls::CertSource::SelfSigned);
+    if self_signed && !new.acme_enabled && new.hostname != old.hostname {
+        match state.certs.generate_self_signed(&new.cert_names()) {
+            Ok(()) => notes.push(format!("reissued the self-signed certificate for {}", new.hostname)),
+            Err(e) => {
+                tracing::error!("regenerating the self-signed certificate failed: {e:#}");
+                notes.push("could not reissue the self-signed certificate".to_string());
+            }
+        }
+    }
+
+    let problems = crate::listeners::reconcile(&state).await;
+
+    // Ask for a certificate as soon as ACME is switched on or retargeted.
+    let acme_changed = new.acme_enabled
+        && (!old.acme_enabled
+            || old.acme_domains != new.acme_domains
+            || old.acme_directory != new.acme_directory);
+    if acme_changed {
+        state.acme.request_renewal();
+        notes.push("requesting a certificate from the CA in the background".to_string());
+    }
+
+    if !problems.is_empty() {
+        return redirect_err("/admin/settings", &format!("Saved, but: {}", problems.join("; ")));
+    }
+    let msg = if notes.is_empty() {
+        "Settings saved and applied".to_string()
+    } else {
+        format!("Settings saved - {}", notes.join("; "))
+    };
+    redirect_ok("/admin/settings", &msg)
+}
+
+async fn tls_renew(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if !state.settings().acme_enabled {
+        return redirect_err("/admin/settings", "Enable Let's Encrypt first");
+    }
+    tracing::info!("admin {} requested a certificate renewal", user.username);
+    // The order takes minutes; run it in the background and let the admin
+    // watch the status panel rather than holding the request open.
+    let bg = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::acme::check_and_renew(&bg, true).await {
+            tracing::warn!("manual ACME renewal failed: {e:#}");
+        }
+    });
+    redirect_ok(
+        "/admin/settings",
+        "Certificate order started - reload this page to follow it",
+    )
+}
+
+async fn tls_self_signed(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match require_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let settings = state.settings();
+    match state.certs.generate_self_signed(&settings.cert_names()) {
+        Ok(()) => {
+            tracing::info!("admin {} regenerated the self-signed certificate", user.username);
+            redirect_ok("/admin/settings", "Self-signed certificate regenerated")
+        }
+        Err(e) => {
+            tracing::error!("self-signed certificate generation failed: {e:#}");
+            redirect_err("/admin/settings", "Could not generate a self-signed certificate")
+        }
+    }
 }

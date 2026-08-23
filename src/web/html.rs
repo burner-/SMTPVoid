@@ -3,9 +3,13 @@
 
 use std::sync::Arc;
 
-use crate::config::{fmt_bytes, fmt_duration, fmt_ts, now_unix};
+use crate::acme::AcmeStatus;
+use crate::config::{fmt_bytes, fmt_duration, fmt_ts, now_unix, BootConfig};
 use crate::db::{AdminUserRow, GlobalStats, SmtpCredential, User};
+use crate::listeners::Kind as ListenerKind;
 use crate::mailstore::{ConnKind, StoredEmail};
+use crate::settings::{Settings, LETSENCRYPT_PRODUCTION, LETSENCRYPT_STAGING};
+use crate::tls::{CertInfo, CertSource};
 
 /// HTML-escape untrusted text.
 pub fn esc(s: &str) -> String {
@@ -81,6 +85,20 @@ code { background:#21262d; padding:1px 6px; border-radius:4px; font-size:13px; }
 .muted { color:var(--muted); }
 .small { font-size:13px; }
 .narrow { max-width:430px; margin:40px auto; }
+.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:0 22px; }
+.field .hint { color:var(--muted); font-size:12px; margin:4px 0 0; }
+.check { display:flex; align-items:flex-start; gap:9px; margin:14px 0 0; }
+.check input { margin:3px 0 0; flex:none; }
+.check .txt { font-size:14px; }
+.check .txt .hint { margin:2px 0 0; }
+input[type=number], input[type=email], input[type=url], textarea, select {
+  width:100%; padding:9px 11px; border-radius:6px; border:1px solid var(--border);
+  background:var(--bg); color:var(--text); font-size:14px; font-family:inherit; }
+textarea { resize:vertical; min-height:64px; }
+.warn { background:#3a2d12; border:1px solid #6b5518; color:var(--amber);
+        border-radius:6px; padding:10px 14px; margin:14px 0; font-size:13px; }
+.stack { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+.stack form { margin:0; }
 footer { max-width:1100px; margin:0 auto; padding:20px; color:var(--muted); font-size:13px;
          border-top:1px solid var(--border); }
 "#;
@@ -98,7 +116,7 @@ pub fn layout(title: &str, nav: Nav, flash_ok: Option<&str>, flash_err: Option<&
         }
         Nav::User(u) => {
             let admin = if u.is_admin {
-                r#"<a href="/admin">Admin</a>"#
+                r#"<a href="/admin">Admin</a><a href="/admin/settings">Settings</a>"#
             } else {
                 ""
             };
@@ -141,7 +159,19 @@ pub fn badge(kind: ConnKind) -> &'static str {
     }
 }
 
-pub fn index_page(smtp_addr: &str, smtps_addr: &str, retention_secs: i64) -> String {
+pub fn index_page(
+    smtp_addr: &str,
+    smtps_addr: &str,
+    retention_secs: i64,
+    registration_open: bool,
+) -> String {
+    let actions = if registration_open {
+        r#"<p><a class="btn" href="/register">Create an account</a> <a class="btn" href="/login">Sign in</a></p>"#.to_string()
+    } else {
+        r#"<p><a class="btn" href="/login">Sign in</a></p>
+<p class="muted small">Registration is closed on this server; ask an administrator for an account.</p>"#
+            .to_string()
+    };
     format!(
         r#"<h1>Send email into the void</h1>
 <p class="sub">A free SMTP testing sink. Point your application at SMTPVoid, send mail to <em>any</em> address, and watch it arrive in your virtual mailbox instead of the real world.</p>
@@ -163,7 +193,7 @@ pub fn index_page(smtp_addr: &str, smtps_addr: &str, retention_secs: i64) -> Str
 <dt>Authentication</dt><dd><code>AUTH PLAIN</code> and <code>AUTH LOGIN</code></dd>
 </div>
 </div>
-<p><a class="btn" href="/register">Create an account</a> <a class="btn" href="/login">Sign in</a></p>"#,
+{actions}"#,
         retention = fmt_duration(retention_secs),
         smtp = esc(smtp_addr),
         smtps = esc(smtps_addr),
@@ -384,7 +414,8 @@ pub fn admin_page(
     let live_bytes: usize = usage.values().map(|(_, b)| b).sum();
     let mut out = format!(
         r#"<h1>Admin</h1>
-<p class="sub">User accounts and statistics. Message contents are private to their owners and not visible here.</p>
+<p class="sub">User accounts and statistics. Message contents are private to their owners and not visible here.
+Server configuration lives under <a href="/admin/settings">Settings</a>.</p>
 <div class="cards">
 <div class="card"><div class="num">{users_n}</div><div class="lbl">Users</div></div>
 <div class="card"><div class="num">{creds}</div><div class="lbl">SMTP credentials</div></div>
@@ -460,5 +491,324 @@ pub fn setup_page() -> String {
 <button class="primary" type="submit">Create admin account</button>
 </form>
 </div></div>"#
+    )
+}
+
+// ---- settings ----
+
+fn text_field(id: &str, label: &str, value: &str, hint: &str, kind: &str) -> String {
+    format!(
+        r#"<div class="field"><label for="{id}">{label}</label>
+<input type="{kind}" id="{id}" name="{id}" value="{value}"><p class="hint">{hint}</p></div>"#,
+        id = esc(id),
+        label = esc(label),
+        value = esc(value),
+        hint = esc(hint),
+        kind = esc(kind),
+    )
+}
+
+fn num_field(id: &str, label: &str, value: impl std::fmt::Display, hint: &str) -> String {
+    format!(
+        r#"<div class="field"><label for="{id}">{label}</label>
+<input type="number" id="{id}" name="{id}" value="{value}"><p class="hint">{hint}</p></div>"#,
+        id = esc(id),
+        label = esc(label),
+        value = esc(&value.to_string()),
+        hint = esc(hint),
+    )
+}
+
+fn check_field(id: &str, label: &str, checked: bool, hint: &str) -> String {
+    format!(
+        r#"<label class="check" for="{id}"><input type="checkbox" id="{id}" name="{id}" value="1"{checked}>
+<span class="txt">{label}<p class="hint">{hint}</p></span></label>"#,
+        id = esc(id),
+        label = esc(label),
+        hint = esc(hint),
+        checked = if checked { " checked" } else { "" },
+    )
+}
+
+/// The TLS certificate / ACME status panel above the settings form.
+fn tls_panel(settings: &Settings, cert: Option<CertInfo>, acme: &AcmeStatus) -> String {
+    let mut out = String::from(r#"<h2>TLS certificate</h2><div class="panel">"#);
+    match cert {
+        Some(info) => {
+            let remaining = info.not_after - now_unix();
+            let expiry = if remaining <= 0 {
+                format!(r#"<span style="color:var(--red)">expired {} ago</span>"#, fmt_duration(-remaining))
+            } else if remaining < 14 * 86_400 {
+                format!(r#"<span style="color:var(--amber)">{} left</span>"#, fmt_duration(remaining))
+            } else {
+                format!(r#"<span style="color:var(--green)">{} left</span>"#, fmt_duration(remaining))
+            };
+            out.push_str(&format!(
+                r#"<div class="kv">
+<dt>Source</dt><dd>{source}</dd>
+<dt>Issuer</dt><dd>{issuer}</dd>
+<dt>Valid for</dt><dd>{names}</dd>
+<dt>Issued</dt><dd>{issued}</dd>
+<dt>Expires</dt><dd>{expires} &mdash; {expiry}</dd>
+</div>"#,
+                source = esc(info.source.label()),
+                issuer = esc(&info.issuer),
+                names = esc(&info.names.join(", ")),
+                issued = fmt_ts(info.not_before),
+                expires = fmt_ts(info.not_after),
+                expiry = expiry,
+            ));
+            if info.source == CertSource::SelfSigned {
+                out.push_str(
+                    r#"<div class="warn">This is a self-signed certificate. Mail clients will refuse it or warn loudly. Configure Let's Encrypt below for a publicly trusted one.</div>"#,
+                );
+            }
+        }
+        None => out.push_str(r#"<p class="muted">No certificate loaded.</p>"#),
+    }
+
+    if settings.acme_enabled {
+        let mut rows = String::new();
+        if acme.running {
+            rows.push_str(&format!(
+                "<dt>In progress</dt><dd>{}</dd>",
+                esc(acme.stage.as_deref().unwrap_or("working"))
+            ));
+        }
+        if let Some(t) = acme.last_attempt {
+            rows.push_str(&format!("<dt>Last attempt</dt><dd>{}</dd>", fmt_ts(t)));
+        }
+        if let Some(t) = acme.last_success {
+            rows.push_str(&format!("<dt>Last success</dt><dd>{}</dd>", fmt_ts(t)));
+        }
+        if let Some(e) = &acme.last_error {
+            rows.push_str(&format!(
+                r#"<dt>Last error</dt><dd style="color:var(--red)">{}</dd>"#,
+                esc(e)
+            ));
+        }
+        if rows.is_empty() {
+            rows.push_str(r#"<dt>Status</dt><dd class="muted">no order attempted yet</dd>"#);
+        }
+        out.push_str(&format!(
+            r#"<h2 style="font-size:15px;margin:20px 0 8px">Let's Encrypt</h2><div class="kv">{rows}</div>"#
+        ));
+    }
+
+    out.push_str(
+        r#"<div class="stack" style="margin-top:16px">
+<form method="post" action="/admin/tls/renew"><button class="primary">Request / renew certificate now</button></form>
+<form method="post" action="/admin/tls/self-signed" onsubmit="return confirm('Replace the current certificate with a freshly generated self-signed one?')"><button>Regenerate self-signed</button></form>
+</div></div>"#,
+    );
+    out
+}
+
+pub fn settings_page(
+    s: &Settings,
+    boot: &BootConfig,
+    cert: Option<CertInfo>,
+    acme: &AcmeStatus,
+    active: &[(ListenerKind, String)],
+) -> String {
+    let running: Vec<String> = active
+        .iter()
+        .map(|(k, addr)| format!("<code>{}</code> {}", esc(addr), esc(k.label())))
+        .collect();
+    let running = if running.is_empty() {
+        r#"<span class="muted">none</span>"#.to_string()
+    } else {
+        running.join(" &middot; ")
+    };
+
+    format!(
+        r#"<h1>Settings</h1>
+<p class="sub">Every setting below is stored in the database and applied without restarting. Listener addresses take effect as soon as you save.</p>
+
+{tls}
+
+<h2>Environment</h2><div class="panel">
+<p class="muted small" style="margin-top:0">These two are fixed at startup: the database lives in the data directory, and a mistyped web address would lock you out of this page.</p>
+<div class="kv">
+<dt>Data directory</dt><dd><code>{data_dir}</code> <span class="muted">(SMTPVOID_DATA_DIR)</span></dd>
+<dt>Web UI (HTTP)</dt><dd><code>{http_addr}</code> <span class="muted">(SMTPVOID_HTTP_ADDR)</span></dd>
+<dt>Running listeners</dt><dd>{running}</dd>
+</div></div>
+
+<form method="post" action="/admin/settings">
+
+<h2>Identity and listeners</h2><div class="panel">
+<div class="grid2">
+{hostname}
+{https_addr}
+{smtp_addr}
+{smtps_addr}
+</div>
+</div>
+
+<h2>Mail behaviour</h2><div class="panel">
+<div class="grid2">
+{retention}
+{cap}
+{maxsize}
+{maxcreds}
+</div>
+</div>
+
+<h2>Access</h2><div class="panel">
+{registration_open}
+{cookie_secure}
+<div class="grid2" style="margin-top:14px">
+{regs_per_hour}
+</div>
+</div>
+
+<h2>Let's Encrypt</h2><div class="panel">
+<p class="muted small" style="margin-top:0">SMTPVoid answers the HTTP-01 challenge on its own listener, so the challenge port must be reachable from the internet on port 80 for every domain listed. The issued certificate is used by STARTTLS, SMTPS and the HTTPS web UI alike.</p>
+{acme_enabled}
+{acme_tos}
+<div class="grid2" style="margin-top:14px">
+{acme_domains}
+{acme_http_addr}
+{acme_contact}
+{acme_renew}
+</div>
+<div class="field" style="margin-top:14px"><label for="acme_directory">ACME directory URL</label>
+<select id="acme_directory" name="acme_directory">
+<option value="{le_prod}"{prod_sel}>Let's Encrypt production</option>
+<option value="{le_stage}"{stage_sel}>Let's Encrypt staging (untrusted certificates, for testing)</option>
+{custom_opt}
+</select><p class="hint">Use staging while you get the DNS and firewall right &mdash; production has strict rate limits.</p></div>
+</div>
+
+<button class="primary" type="submit">Save settings</button>
+</form>"#,
+        tls = tls_panel(s, cert, acme),
+        data_dir = esc(&boot.data_dir.display().to_string()),
+        http_addr = esc(&boot.http_addr),
+        running = running,
+        hostname = text_field(
+            "hostname",
+            "SMTP hostname",
+            &s.hostname,
+            "Announced in the SMTP banner and used for the self-signed certificate.",
+            "text",
+        ),
+        https_addr = text_field(
+            "https_addr",
+            "HTTPS web UI address",
+            &s.https_addr,
+            "Empty disables HTTPS. Uses the certificate above, e.g. 0.0.0.0:443.",
+            "text",
+        ),
+        smtp_addr = text_field(
+            "smtp_addr",
+            "SMTP address (plaintext + STARTTLS)",
+            &s.smtp_addr,
+            "Standard ports are 25 and 587; binding below 1024 needs CAP_NET_BIND_SERVICE.",
+            "text",
+        ),
+        smtps_addr = text_field(
+            "smtps_addr",
+            "SMTPS address (implicit TLS)",
+            &s.smtps_addr,
+            "The standard port is 465.",
+            "text",
+        ),
+        retention = num_field(
+            "retention_secs",
+            "Retention (seconds)",
+            s.retention_secs,
+            "How long a captured message survives. Applies to mail already in the store too.",
+        ),
+        cap = num_field(
+            "mailbox_cap",
+            "Messages per mailbox",
+            s.mailbox_cap,
+            "The oldest message is evicted once a mailbox is full.",
+        ),
+        maxsize = num_field(
+            "max_message_size",
+            "Max message size (bytes)",
+            s.max_message_size,
+            "Advertised to clients via the ESMTP SIZE extension.",
+        ),
+        maxcreds = num_field(
+            "max_credentials_per_user",
+            "SMTP credentials per user",
+            s.max_credentials_per_user,
+            "How many credential pairs one account may hold at a time.",
+        ),
+        registration_open = check_field(
+            "registration_open",
+            "Open registration",
+            s.registration_open,
+            "When off, nobody can create an account through the web UI.",
+        ),
+        cookie_secure = check_field(
+            "cookie_secure",
+            "Mark session cookies Secure",
+            s.cookie_secure,
+            "Turn on when the UI is only reachable over HTTPS. With this on, sign-in stops working over plain HTTP.",
+        ),
+        regs_per_hour = num_field(
+            "registrations_per_hour",
+            "Registrations per IP per hour",
+            s.registrations_per_hour,
+            "Throttles account creation from a single address.",
+        ),
+        acme_enabled = check_field(
+            "acme_enabled",
+            "Obtain and renew a certificate automatically",
+            s.acme_enabled,
+            "Renewal is checked every six hours and runs when the certificate is close to expiry.",
+        ),
+        acme_tos = check_field(
+            "acme_tos_agreed",
+            "I accept the certificate authority's terms of service",
+            s.acme_tos_agreed,
+            "Required by the ACME protocol before an account can be registered.",
+        ),
+        acme_domains = text_field(
+            "acme_domains",
+            "Domains",
+            &s.acme_domains.join(", "),
+            "Comma-separated. Each must resolve to this server over the public internet.",
+            "text",
+        ),
+        acme_http_addr = text_field(
+            "acme_http_addr",
+            "HTTP-01 challenge address",
+            &s.acme_http_addr,
+            "Must be port 80 as seen from the internet; the CA does not follow other ports.",
+            "text",
+        ),
+        acme_contact = text_field(
+            "acme_contact_email",
+            "Contact email (optional)",
+            &s.acme_contact_email,
+            "The CA uses it for expiry warnings.",
+            "email",
+        ),
+        acme_renew = num_field(
+            "acme_renew_before_days",
+            "Renew when days remaining below",
+            s.acme_renew_before_days,
+            "Let's Encrypt certificates last 90 days; 30 is the usual choice.",
+        ),
+        le_prod = esc(LETSENCRYPT_PRODUCTION),
+        le_stage = esc(LETSENCRYPT_STAGING),
+        prod_sel = if s.acme_directory == LETSENCRYPT_PRODUCTION { " selected" } else { "" },
+        stage_sel = if s.acme_directory == LETSENCRYPT_STAGING { " selected" } else { "" },
+        custom_opt = if s.acme_directory != LETSENCRYPT_PRODUCTION
+            && s.acme_directory != LETSENCRYPT_STAGING
+        {
+            format!(
+                r#"<option value="{v}" selected>{v}</option>"#,
+                v = esc(&s.acme_directory)
+            )
+        } else {
+            String::new()
+        },
     )
 }

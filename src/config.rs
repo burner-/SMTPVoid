@@ -1,47 +1,29 @@
 use std::path::PathBuf;
 
-/// Runtime configuration, read from environment variables with sane defaults.
+/// The only configuration that still comes from the environment.
+///
+/// Everything else is a [`crate::settings::Settings`] row in the database,
+/// editable at `/admin/settings`. These two cannot be: the database that holds
+/// the settings lives in `data_dir`, and if a bad `http_addr` were persisted
+/// there would be no way back into the UI to fix it.
 #[derive(Debug, Clone)]
-pub struct Config {
-    /// Directory for the SQLite database, TLS material and the admin setup token.
+pub struct BootConfig {
+    /// Directory for the SQLite database, TLS material, ACME state and the
+    /// admin setup token.
     pub data_dir: PathBuf,
-    /// Address the web UI listens on.
+    /// Address the plaintext web UI listens on. Always bound, never restarted.
     pub http_addr: String,
-    /// Address of the plaintext SMTP listener (also offers STARTTLS).
-    pub smtp_addr: String,
-    /// Address of the implicit-TLS SMTP listener (SMTPS).
-    pub smtps_addr: String,
-    /// Hostname used in the SMTP banner and the self-signed certificate.
-    pub hostname: String,
-    /// How long received messages are kept before they vanish.
-    pub retention_secs: u64,
-    /// Maximum number of messages kept per mailbox (oldest evicted first).
-    pub mailbox_cap: usize,
-    /// Maximum accepted message size in bytes (advertised via SIZE).
-    pub max_message_size: usize,
-    /// Maximum SMTP credentials per user account.
-    pub max_credentials_per_user: i64,
-    /// Set the Secure flag on session cookies (enable behind HTTPS).
-    pub cookie_secure: bool,
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-impl Config {
+impl BootConfig {
     pub fn from_env() -> Self {
-        Config {
+        BootConfig {
             data_dir: PathBuf::from(env_or("SMTPVOID_DATA_DIR", "./data")),
             http_addr: env_or("SMTPVOID_HTTP_ADDR", "0.0.0.0:8080"),
-            smtp_addr: env_or("SMTPVOID_SMTP_ADDR", "0.0.0.0:2525"),
-            smtps_addr: env_or("SMTPVOID_SMTPS_ADDR", "0.0.0.0:4650"),
-            hostname: env_or("SMTPVOID_HOSTNAME", "smtpvoid.local"),
-            retention_secs: env_or("SMTPVOID_RETENTION_SECS", "3600").parse().unwrap_or(3600),
-            mailbox_cap: env_or("SMTPVOID_MAILBOX_CAP", "100").parse().unwrap_or(100),
-            max_message_size: env_or("SMTPVOID_MAX_MESSAGE_SIZE", "1048576").parse().unwrap_or(1_048_576),
-            max_credentials_per_user: env_or("SMTPVOID_MAX_CREDENTIALS", "20").parse().unwrap_or(20),
-            cookie_secure: env_or("SMTPVOID_COOKIE_SECURE", "0") == "1",
         }
     }
 }
