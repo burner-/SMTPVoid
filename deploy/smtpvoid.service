@@ -1,0 +1,35 @@
+# systemd unit for SMTPVoid.
+# Install the binary to /usr/local/bin/smtpvoid, then:
+#   sudo useradd --system --home /var/lib/smtpvoid --create-home smtpvoid
+#   sudo cp deploy/smtpvoid.service /etc/systemd/system/
+#   sudo systemctl enable --now smtpvoid
+[Unit]
+Description=SMTPVoid - SMTP black hole for testing mail submission
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=smtpvoid
+Group=smtpvoid
+ExecStart=/usr/local/bin/smtpvoid
+Environment=SMTPVOID_DATA_DIR=/var/lib/smtpvoid
+Environment=SMTPVOID_HOSTNAME=smtp.example.test
+# Uncomment to use privileged standard ports directly:
+#Environment=SMTPVOID_SMTP_ADDR=0.0.0.0:587
+#Environment=SMTPVOID_SMTPS_ADDR=0.0.0.0:465
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/smtpvoid
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
