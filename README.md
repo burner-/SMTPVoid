@@ -1,12 +1,13 @@
 # SMTPVoid
 
 An SMTP black hole for testing mail submission.
+This code is 100% vibecoded so use with your own risk ;) 
 
 SMTPVoid looks and behaves like a real submission server — it speaks ESMTP, supports
 `AUTH PLAIN`/`AUTH LOGIN`, and accepts mail for **any** recipient over plaintext,
 STARTTLS, or implicit TLS. But every message falls into the void: it is captured into
 the sending user's private in-memory mailbox, expires after one hour, and is **never
-delivered, relayed, or written to disk**. The service cannot be used for spam.
+delivered or relayed**. 
 
 ## Features
 
