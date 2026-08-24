@@ -92,7 +92,7 @@ pub async fn reconcile(state: &Arc<AppState>) -> Vec<String> {
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                let msg = format!("cannot bind {} to {addr}: {e}", kind.label());
+                let msg = format!("cannot bind {} to {addr}: {e}{}", kind.label(), bind_hint(&addr, &e));
                 tracing::error!("{msg}");
                 if let Some(old) = slots.get(&kind) {
                     errors.push(format!("{msg} (still serving on {})", old.addr));
@@ -114,6 +114,22 @@ pub async fn reconcile(state: &Arc<AppState>) -> Vec<String> {
     }
 
     errors
+}
+
+/// The default SMTP ports are privileged, so "permission denied" is the single
+/// most likely bind failure. Say what to do about it rather than just the errno.
+fn bind_hint(addr: &str, e: &std::io::Error) -> String {
+    let privileged = addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .is_some_and(|p| p < 1024);
+    if privileged && e.kind() == std::io::ErrorKind::PermissionDenied {
+        " (ports below 1024 need CAP_NET_BIND_SERVICE, a port redirect, \
+          or a higher port set at /admin/settings)"
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn spawn(kind: Kind, state: Arc<AppState>, listener: TcpListener) -> JoinHandle<()> {

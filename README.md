@@ -59,8 +59,8 @@ listeners to new addresses, which happens without dropping the process.
 | Setting | Default | Description |
 |---|---|---|
 | SMTP hostname | `smtpvoid.local` | Hostname in the SMTP banner and the self-signed certificate |
-| SMTP address | `0.0.0.0:2525` | Plaintext listener, also offers STARTTLS |
-| SMTPS address | `0.0.0.0:4650` | Implicit-TLS listener |
+| SMTP address | `0.0.0.0:587` | Submission listener (plaintext, offers STARTTLS) |
+| SMTPS address | `0.0.0.0:465` | Implicit-TLS submission listener |
 | HTTPS web UI address | *(empty)* | Serves the UI over TLS with the same certificate; empty disables it |
 | Retention | `3600` s | How long messages are kept; re-dates mail already in the store |
 | Messages per mailbox | `100` | Oldest evicted past this |
@@ -81,10 +81,22 @@ the page that fixes it:
 | `SMTPVOID_HTTP_ADDR` | `0.0.0.0:8080` | Plaintext web UI address; bound at startup and never moved |
 | `RUST_LOG` | `info` | Log filter (`tracing_subscriber` syntax) |
 
-To bind the standard ports (25/587, 465, plus 80 and 443 for ACME and HTTPS) on
-Linux, use `CAP_NET_BIND_SERVICE` (see
+### Ports and privileges
+
+SMTPVoid is a *submission* server — it requires `AUTH` before `MAIL FROM` and
+never relays — so it defaults to the submission ports from RFC 6409 and RFC 8314:
+**587** for STARTTLS and **465** for implicit TLS. Port 25 is for MTA-to-MTA
+relay and is deliberately not used.
+
+Both defaults are privileged, as are 80 (ACME) and 443 (HTTPS UI). On Linux give
+the process `CAP_NET_BIND_SERVICE` (see
 [deploy/smtpvoid.service](deploy/smtpvoid.service)), run behind a load balancer,
-or redirect ports with nftables.
+or redirect ports with nftables. Without any of those the bind fails, but the
+process keeps running and logs what to do — the web UI stays reachable so you can
+set unprivileged ports (e.g. `0.0.0.0:2525` and `0.0.0.0:4650`) under Settings.
+
+Changing the defaults only affects fresh installations. An existing deployment
+keeps whatever is already stored in its database.
 
 ## Let's Encrypt
 
@@ -115,7 +127,7 @@ A container image and a systemd unit are provided:
 ```bash
 docker build -t smtpvoid .
 docker run -d --name smtpvoid \
-  -p 8080:8080 -p 25:25 -p 587:587 -p 465:465 -p 80:80 -p 443:443 \
+  -p 8080:8080 -p 587:587 -p 465:465 -p 80:80 -p 443:443 \
   -v smtpvoid-data:/data -e SMTPVOID_DATA_DIR=/data \
   smtpvoid
 ```
@@ -124,6 +136,11 @@ Then open `/setup`, create the admin account and set the hostname, listener
 addresses and Let's Encrypt options under **Settings**. Publish only the ports
 you actually intend to use; 80 and 443 are needed only for ACME and the built-in
 HTTPS UI respectively.
+
+The image runs unprivileged, and the binary carries
+`cap_net_bind_service`, so the privileged defaults bind without extra flags. If
+your runtime drops that capability, publish a remapped port instead (for example
+`-p 587:2525`) and set the matching unprivileged address under Settings.
 
 Alternatively copy the release binary to a server and install
 [deploy/smtpvoid.service](deploy/smtpvoid.service).
@@ -138,17 +155,18 @@ cookie flag there.
 Anything that speaks SMTP works. For example with `swaks`:
 
 ```bash
-swaks --server smtp.example.test:2525 --tls \
+swaks --server smtp.example.test:587 --tls \
   --auth-user sv_xxxxxxxxxx --auth-password '...' \
   --from tester@example.test --to anyone@anywhere.example
 ```
 
-A development smoke-test client is included:
+A development smoke-test client is included (pass whichever ports the server is
+actually listening on):
 
 ```bash
-cargo run --example smoke_client -- plain    localhost:2525 <user> <pass>
-cargo run --example smoke_client -- starttls localhost:2525 <user> <pass>
-cargo run --example smoke_client -- tls      localhost:4650 <user> <pass>
+cargo run --example smoke_client -- plain    localhost:587 <user> <pass>
+cargo run --example smoke_client -- starttls localhost:587 <user> <pass>
+cargo run --example smoke_client -- tls      localhost:465 <user> <pass>
 ```
 
 ## Security model & abuse resistance

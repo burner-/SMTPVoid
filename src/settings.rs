@@ -66,8 +66,12 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             hostname: "smtpvoid.local".to_string(),
-            smtp_addr: "0.0.0.0:2525".to_string(),
-            smtps_addr: "0.0.0.0:4650".to_string(),
+            // The standard submission ports (RFC 6409 / RFC 8314). Both are
+            // privileged, so an unprivileged process needs CAP_NET_BIND_SERVICE
+            // or a port redirect; the listener supervisor reports a failed bind
+            // and leaves the web UI up so the ports can be changed there.
+            smtp_addr: "0.0.0.0:587".to_string(),
+            smtps_addr: "0.0.0.0:465".to_string(),
             https_addr: String::new(),
             retention_secs: 3600,
             mailbox_cap: 100,
@@ -270,7 +274,7 @@ fn check_addr(label: &str, addr: &str, allow_empty: bool) -> Result<(), String> 
     }
     let port = match addr.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() => port,
-        _ => return Err(format!("{label} must be in host:port form, e.g. 0.0.0.0:2525")),
+        _ => return Err(format!("{label} must be in host:port form, e.g. 0.0.0.0:587")),
     };
     match port.parse::<u16>() {
         Ok(p) if p > 0 => Ok(()),

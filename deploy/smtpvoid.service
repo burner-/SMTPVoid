@@ -17,8 +17,9 @@ ExecStart=/usr/local/bin/smtpvoid
 Environment=SMTPVOID_DATA_DIR=/var/lib/smtpvoid
 Environment=SMTPVOID_HTTP_ADDR=0.0.0.0:8080
 
-# Needed to bind the privileged ports the admin UI can be pointed at:
-# 25/587 (SMTP), 465 (SMTPS), 80 (ACME HTTP-01 challenge), 443 (HTTPS UI).
+# Required by the default submission ports 587 (STARTTLS) and 465 (implicit
+# TLS), and by 80 (ACME HTTP-01 challenge) and 443 (HTTPS UI) if those are
+# enabled. Without it the listeners fail to bind, though the web UI stays up.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
