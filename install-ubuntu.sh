@@ -191,13 +191,28 @@ apt-get install -y -qq --no-install-recommends \
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
+# The cargo this script installs is a rustup shim, and a shim locates its
+# toolchain through RUSTUP_HOME. Without it, /opt/rust/cargo/bin/cargo cannot
+# even print its own version - it looks for toolchains under root's home and
+# fails - so a later run would skip the toolchain the first run installed.
+use_rust_env() {
+    case "$1" in
+        "$RUST_ROOT"/*) export RUSTUP_HOME=$RUST_ROOT/rustup CARGO_HOME=$RUST_ROOT/cargo ;;
+    esac
+}
+
 CARGO=
 
 if [ -z "$PREBUILT_BINARY" ]; then
     for candidate in "$RUST_ROOT/cargo/bin/cargo" "$HOME/.cargo/bin/cargo" "$(command -v cargo || true)"; do
         [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-        have=$("$candidate" --version 2>/dev/null | awk '{print $2}')
-        [ -n "$have" ] || continue
+        # Probed in a subshell, so the environment follows the candidate
+        # instead of leaking into the next one.
+        have=$( (use_rust_env "$candidate"; "$candidate" --version) 2>/dev/null | awk '{print $2}' )
+        if [ -z "$have" ]; then
+            warn "$candidate did not run - skipping it"
+            continue
+        fi
         if version_ge "$have" "$MIN_RUST"; then
             CARGO=$candidate
             say "Using the Rust toolchain already installed: cargo $have ($candidate)"
@@ -221,10 +236,9 @@ fi
 
 BUILT_BINARY=$PREBUILT_BINARY
 if [ -z "$BUILT_BINARY" ]; then
-    say "Building the release binary (a few minutes on a small VM)"
-    # RUSTUP_HOME/CARGO_HOME are exported only by the rustup branch above: a
-    # toolchain found elsewhere keeps its own, or its shim would look for
-    # toolchains in a directory that does not exist.
+    say "Building the release binary with $CARGO (a few minutes on a small VM)"
+    # A toolchain outside /opt/rust keeps whatever environment it came with.
+    use_rust_env "$CARGO"
     ( cd "$SRC_DIR" && "$CARGO" build --release --locked )
     BUILT_BINARY=$SRC_DIR/target/release/smtpvoid
     [ -x "$BUILT_BINARY" ] || die "the build finished but $BUILT_BINARY is missing"
@@ -255,7 +269,7 @@ install -d "$BIN_DIR"
 # "nothing happened" and "nothing needed to happen" look identical otherwise.
 if cmp -s "$BUILT_BINARY" "$TARGET_BINARY" 2>/dev/null; then
     BINARY_STATE="unchanged"
-    say "Binary already up to date at $TARGET_BINARY"
+    say "Binary unchanged - the build produced the same image as the installed one"
 else
     BINARY_STATE="updated"
     say "Installing $TARGET_BINARY"
