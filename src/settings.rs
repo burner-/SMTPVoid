@@ -198,17 +198,17 @@ impl Settings {
         if !valid_hostname(&self.hostname) {
             return Err("Hostname must be a plain DNS name (letters, digits, - and .)".into());
         }
-        check_addr("SMTP address", &self.smtp_addr, false)?;
-        check_addr("SMTPS address", &self.smtps_addr, false)?;
-        check_addr("HTTPS address", &self.https_addr, true)?;
+        check_addr("SMTP bind address", &self.smtp_addr, false)?;
+        check_addr("SMTPS bind address", &self.smtps_addr, false)?;
+        check_addr("HTTPS bind address", &self.https_addr, true)?;
 
         if self.smtp_addr == self.smtps_addr {
-            return Err("SMTP and SMTPS cannot share the same address".into());
+            return Err("SMTP and SMTPS cannot share the same bind address".into());
         }
         if !self.https_addr.is_empty()
             && (self.https_addr == self.smtp_addr || self.https_addr == self.smtps_addr)
         {
-            return Err("HTTPS cannot share an address with an SMTP listener".into());
+            return Err("HTTPS cannot share a bind address with an SMTP listener".into());
         }
 
         if !(60..=30 * 86_400).contains(&self.retention_secs) {
@@ -246,9 +246,9 @@ impl Settings {
             if !self.acme_contact_email.is_empty() && !self.acme_contact_email.contains('@') {
                 return Err("The ACME contact must be an email address".into());
             }
-            check_addr("ACME challenge address", &self.acme_http_addr, true)?;
+            check_addr("ACME challenge bind address", &self.acme_http_addr, true)?;
             if self.acme_http_addr.is_empty() {
-                return Err("Let's Encrypt needs an HTTP-01 challenge address (usually 0.0.0.0:80)".into());
+                return Err("Let's Encrypt needs an HTTP-01 challenge bind address (usually 0.0.0.0:80)".into());
             }
             if !(1..=80).contains(&self.acme_renew_before_days) {
                 return Err("Renewal window must be between 1 and 80 days".into());

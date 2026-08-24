@@ -623,15 +623,15 @@ pub fn settings_page(
 
     format!(
         r#"<h1>Settings</h1>
-<p class="sub">Every setting below is stored in the database and applied without restarting. Listener addresses take effect as soon as you save.</p>
+<p class="sub">Every setting below is stored in the database and applied without restarting. Listener bind addresses take effect as soon as you save.</p>
 
 {tls}
 
 <h2>Environment</h2><div class="panel">
-<p class="muted small" style="margin-top:0">These two are fixed at startup: the database lives in the data directory, and a mistyped web address would lock you out of this page.</p>
+<p class="muted small" style="margin-top:0">These two are fixed at startup: the database lives in the data directory, and a mistyped web bind address would lock you out of this page.</p>
 <div class="kv">
 <dt>Data directory</dt><dd><code>{data_dir}</code> <span class="muted">(SMTPVOID_DATA_DIR)</span></dd>
-<dt>Web UI (HTTP)</dt><dd><code>{http_addr}</code> <span class="muted">(SMTPVOID_HTTP_ADDR)</span></dd>
+<dt>Web UI bind address (HTTP)</dt><dd><code>{http_addr}</code> <span class="muted">(SMTPVOID_HTTP_ADDR)</span></dd>
 <dt>Running listeners</dt><dd>{running}</dd>
 </div></div>
 
@@ -696,21 +696,21 @@ pub fn settings_page(
         ),
         https_addr = text_field(
             "https_addr",
-            "HTTPS web UI address",
+            "HTTPS web UI bind address",
             &s.https_addr,
             "Empty disables HTTPS. Uses the certificate above, e.g. 0.0.0.0:443.",
             "text",
         ),
         smtp_addr = text_field(
             "smtp_addr",
-            "SMTP address (plaintext + STARTTLS)",
+            "SMTP bind address (plaintext + STARTTLS)",
             &s.smtp_addr,
             "Standard ports are 25 and 587; binding below 1024 needs CAP_NET_BIND_SERVICE.",
             "text",
         ),
         smtps_addr = text_field(
             "smtps_addr",
-            "SMTPS address (implicit TLS)",
+            "SMTPS bind address (implicit TLS)",
             &s.smtps_addr,
             "The standard port is 465.",
             "text",
@@ -755,7 +755,7 @@ pub fn settings_page(
             "registrations_per_hour",
             "Registrations per IP per hour",
             s.registrations_per_hour,
-            "Throttles account creation from a single address.",
+            "Throttles account creation from a single client IP address.",
         ),
         acme_enabled = check_field(
             "acme_enabled",
@@ -778,7 +778,7 @@ pub fn settings_page(
         ),
         acme_http_addr = text_field(
             "acme_http_addr",
-            "HTTP-01 challenge address",
+            "HTTP-01 challenge bind address",
             &s.acme_http_addr,
             "Must be port 80 as seen from the internet; the CA does not follow other ports.",
             "text",
