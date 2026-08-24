@@ -10,10 +10,14 @@
 # data directory (database, TLS material, ACME state) is left untouched.
 #
 #   sudo ./install-ubuntu.sh
-#   sudo ./install-ubuntu.sh --data-dir /srv/smtpvoid --http-addr 127.0.0.1:8080
+#   sudo ./install-ubuntu.sh --pull                 # update to the latest commit
+#   sudo ./install-ubuntu.sh --domain mail.example.com --letsencrypt --agree-tos
 #   sudo ./install-ubuntu.sh --binary ./target/release/smtpvoid   # skip the build
 #
 set -euo pipefail
+
+# Kept for the re-exec after --pull updates this file; see below.
+ORIGINAL_ARGS=("$@")
 
 SERVICE_USER=smtpvoid
 DATA_DIR=/var/lib/smtpvoid
@@ -23,6 +27,7 @@ UNIT_DIR=/etc/systemd/system
 PREBUILT_BINARY=
 OPEN_FIREWALL=0
 START_SERVICE=1
+PULL=0
 DOMAINS=
 LETSENCRYPT=0
 AGREE_TOS=0
@@ -35,6 +40,7 @@ HTTPS_ADDR=
 MIN_RUST=1.82.0
 
 SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SRC_OWNER=root
 RUST_ROOT=/opt/rust
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -62,6 +68,8 @@ Options:
   --http-addr ADDR     plaintext web UI address (default: 0.0.0.0:8080)
   --prefix DIR         where to install the binary (default: /usr/local/bin)
   --binary PATH        install this prebuilt binary instead of building
+  --pull               git pull --ff-only in this source tree before building,
+                       so one command updates the service to the latest commit
   --open-firewall      open 8080, 587, 465, 80 and 443 in ufw, if ufw is active
   --no-start           install and enable the unit but do not start it now
   -h, --help           show this help
@@ -88,6 +96,7 @@ while [ $# -gt 0 ]; do
         --http-addr)      HTTP_ADDR=${2:?--http-addr needs a value}; shift 2 ;;
         --prefix)         BIN_DIR=${2:?--prefix needs a value}; shift 2 ;;
         --binary)         PREBUILT_BINARY=${2:?--binary needs a value}; shift 2 ;;
+        --pull)           PULL=1; shift ;;
         --open-firewall)  OPEN_FIREWALL=1; shift ;;
         --no-start)       START_SERVICE=0; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -128,6 +137,42 @@ if [ -n "$PREBUILT_BINARY" ]; then
     [ -x "$PREBUILT_BINARY" ] || die "$PREBUILT_BINARY is not an executable file"
 elif [ ! -f "$SRC_DIR/Cargo.toml" ]; then
     die "no Cargo.toml in $SRC_DIR - run this from the SMTPVoid source tree, or pass --binary"
+fi
+
+# -------------------------------------------------------------- new sources
+
+# Root pulling into someone else's checkout would leave root-owned objects
+# behind, and git refuses the "dubious ownership" case anyway, so the pull runs
+# as whoever owns the tree.
+git_src() {
+    if [ "$SRC_OWNER" = root ]; then
+        git -C "$SRC_DIR" "$@"
+    else
+        runuser -u "$SRC_OWNER" -- git -C "$SRC_DIR" "$@"
+    fi
+}
+
+if [ "$PULL" -eq 1 ]; then
+    command -v git >/dev/null || die "--pull needs git installed"
+    [ -d "$SRC_DIR/.git" ] || die "--pull needs $SRC_DIR to be a git checkout"
+    SRC_OWNER=$(stat -c %U "$SRC_DIR/.git")
+    [ "$SRC_OWNER" = root ] || command -v runuser >/dev/null \
+        || die "--pull needs runuser to pull as $SRC_OWNER, who owns $SRC_DIR"
+
+    before=$(git_src rev-parse --short HEAD)
+    say "Updating the source tree (git pull --ff-only, as $SRC_OWNER)"
+    git_src pull --ff-only
+    after=$(git_src rev-parse --short HEAD)
+    if [ "$before" = "$after" ]; then
+        say "Source already current at $after"
+    else
+        say "Source $before -> $after"
+        # bash reads a script lazily, so the pull may just have rewritten the
+        # lines this run has not reached yet. Start over from the new copy.
+        # The repeat pull is a no-op, so this can only happen once.
+        say "Restarting with the updated installer"
+        exec bash "$SRC_DIR/install-ubuntu.sh" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+    fi
 fi
 
 # ------------------------------------------------------------- dependencies
@@ -204,8 +249,17 @@ install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$DATA_DIR"
 # ------------------------------------------------------------------ install
 
 TARGET_BINARY=$BIN_DIR/smtpvoid
-say "Installing $TARGET_BINARY"
 install -d "$BIN_DIR"
+
+# A re-run is meant to upgrade, so say plainly whether this one moved anything -
+# "nothing happened" and "nothing needed to happen" look identical otherwise.
+if cmp -s "$BUILT_BINARY" "$TARGET_BINARY" 2>/dev/null; then
+    BINARY_STATE="unchanged"
+    say "Binary already up to date at $TARGET_BINARY"
+else
+    BINARY_STATE="updated"
+    say "Installing $TARGET_BINARY"
+fi
 # Write beside the target and rename, so a running instance is never handed a
 # half-written file; the restart below picks up the new inode.
 install -m 0755 "$BUILT_BINARY" "$TARGET_BINARY.new"
@@ -220,16 +274,27 @@ else
     warn "setcap failed (unsupported filesystem?) - the unit's AmbientCapabilities still cover the service"
 fi
 
-say "Installing $UNIT_DIR/smtpvoid.service"
+UNIT_FILE=$UNIT_DIR/smtpvoid.service
 sed -e "s|^User=.*|User=$SERVICE_USER|" \
     -e "s|^Group=.*|Group=$SERVICE_USER|" \
     -e "s|^ExecStart=.*|ExecStart=$TARGET_BINARY|" \
     -e "s|^Environment=SMTPVOID_DATA_DIR=.*|Environment=SMTPVOID_DATA_DIR=$DATA_DIR|" \
     -e "s|^Environment=SMTPVOID_HTTP_ADDR=.*|Environment=SMTPVOID_HTTP_ADDR=$HTTP_ADDR|" \
     -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR|" \
-    "$UNIT_TEMPLATE" > "$UNIT_DIR/smtpvoid.service"
-chmod 0644 "$UNIT_DIR/smtpvoid.service"
+    "$UNIT_TEMPLATE" > "$UNIT_FILE.new"
 
+if cmp -s "$UNIT_FILE.new" "$UNIT_FILE" 2>/dev/null; then
+    UNIT_STATE="unchanged"
+    say "Unit already up to date at $UNIT_FILE"
+    rm -f "$UNIT_FILE.new"
+else
+    UNIT_STATE="updated"
+    say "Installing $UNIT_FILE"
+    mv -f "$UNIT_FILE.new" "$UNIT_FILE"
+fi
+chmod 0644 "$UNIT_FILE"
+
+# Unconditional: cheap, and it also picks up an edit made outside this script.
 systemctl daemon-reload
 
 # ---------------------------------------------------------------- the domain
@@ -280,7 +345,13 @@ if [ "$START_SERVICE" -eq 0 ]; then
     exit 0
 fi
 
-say "Starting smtpvoid"
+# The restart is what actually puts the new binary and settings into service,
+# so it happens on every run, whether or not anything above changed.
+if systemctl is-active --quiet smtpvoid; then
+    say "Restarting smtpvoid (it was running)"
+else
+    say "Starting smtpvoid"
+fi
 systemctl restart smtpvoid
 
 # Give it a moment to bind, seed the database and write the setup token.
@@ -304,12 +375,32 @@ else
 fi
 PORT=${HTTP_ADDR##*:}
 
+MAIN_PID=$(systemctl show -p MainPID --value smtpvoid 2>/dev/null || echo 0)
+SINCE=$(systemctl show -p ActiveEnterTimestamp --value smtpvoid 2>/dev/null || true)
+
+# The symptom of a failed upgrade is a service still running the old image, so
+# check what the process actually executes rather than trusting the restart.
+if [ "${MAIN_PID:-0}" -gt 0 ] && [ -r "/proc/$MAIN_PID/exe" ]; then
+    RUNNING=$(readlink "/proc/$MAIN_PID/exe" || true)
+    case "$RUNNING" in
+        "$TARGET_BINARY") ;;
+        "") ;;
+        *) warn "the service is running $RUNNING, not $TARGET_BINARY - check ExecStart in $UNIT_FILE" ;;
+    esac
+fi
+
 echo
 say "SMTPVoid is running."
 echo
 echo "  Web UI     http://$HOST:$PORT/"
 echo "  Data dir   $DATA_DIR"
 echo "  Logs       journalctl -u smtpvoid -f"
+echo "  Binary     $TARGET_BINARY ($BINARY_STATE)"
+echo "  Unit       $UNIT_FILE ($UNIT_STATE)"
+echo "  Service    restarted${SINCE:+ at $SINCE}${MAIN_PID:+, pid $MAIN_PID}"
+if REV=$(git -C "$SRC_DIR" describe --always --dirty 2>/dev/null); then
+    echo "  Built from $REV"
+fi
 if [ -n "$DOMAINS" ]; then
     echo "  Domain     ${DOMAINS%% *} (SMTP hostname and certificate name)"
 fi

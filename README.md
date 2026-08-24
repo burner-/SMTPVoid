@@ -170,11 +170,25 @@ sudo ./install-ubuntu.sh --domain mail.example.com \
   --letsencrypt --agree-tos --email ops@example.com --https
 ```
 
-Repeat `--domain` to put more names on the certificate. The installer is
-idempotent — run it again after `git pull` to rebuild and restart without
-touching the data directory. `--data-dir`, `--http-addr`, `--user`, `--prefix`,
-`--binary` (skip the build), `--acme-staging`, `--open-firewall` and
-`--no-start` are available too; see `./install-ubuntu.sh --help`.
+Repeat `--domain` to put more names on the certificate.
+
+The same script is the upgrade path. `--pull` fast-forwards the checkout first,
+so one command takes a deployment to the latest commit:
+
+```bash
+sudo ./install-ubuntu.sh --pull
+```
+
+Every run rebuilds, reinstalls the binary and the unit, and restarts the
+service, whether or not anything changed — the data directory (database, TLS
+material, ACME state) is never touched. The closing summary says which parts
+were actually updated, when the service restarted and which revision it was
+built from, and it warns if the running process is not the binary that was just
+installed.
+
+`--data-dir`, `--http-addr`, `--user`, `--prefix`, `--binary` (skip the build),
+`--acme-staging`, `--open-firewall` and `--no-start` are available too; see
+`./install-ubuntu.sh --help`.
 
 ### Container
 
