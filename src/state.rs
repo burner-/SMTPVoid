@@ -38,8 +38,6 @@ pub struct AppState {
     pub listeners: Listeners,
     /// Web sessions: token -> session. In-memory only; restart logs everyone out.
     pub sessions: Mutex<HashMap<String, WebSession>>,
-    /// One-time reveal of freshly created SMTP credentials, keyed by session token.
-    pub reveals: Mutex<HashMap<String, (String, String)>>,
     /// Admin bootstrap token; None once an admin account exists.
     pub setup_token: Mutex<Option<String>>,
     /// Registration throttle: ip -> (window start, count in window).
@@ -80,7 +78,6 @@ impl AppState {
             acme,
             listeners: Listeners::default(),
             sessions: Mutex::new(HashMap::new()),
-            reveals: Mutex::new(HashMap::new()),
             setup_token: Mutex::new(setup_token),
             reg_throttle: Mutex::new(HashMap::new()),
             started_at: now_unix(),

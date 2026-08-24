@@ -27,6 +27,9 @@ const MAX_RCPT: usize = 50;
 const MAX_MESSAGES_PER_CONN: u32 = 100;
 const MAX_AUTH_FAILURES: u32 = 5;
 const MAX_ERRORS: u32 = 20;
+/// Compared against when the SMTP username does not exist, so a failed AUTH
+/// costs the same either way. Its length matches a generated password.
+const UNKNOWN_CRED_PLACEHOLDER: &str = "smtpvoid-no-such-credential-x";
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
@@ -414,23 +417,16 @@ impl Session {
     async fn try_auth(&mut self, username: &str, password: &str, mechanism: &str) -> Result<()> {
         let cred = self.state.db.get_credential_for_auth(username)?;
         let password = password.to_string();
-        let ok_cred: Option<CredAuth> = tokio::task::spawn_blocking(move || {
-            match cred {
-                Some(c) => {
-                    if crate::web::verify_password(&password, &c.password_hash) {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    // Constant-ish time: burn an argon2 verification anyway.
-                    crate::web::verify_password(&password, crate::web::dummy_hash());
-                    None
-                }
+        // The stored password is a random secret this server generated, so a
+        // direct comparison is all it takes. An unknown username compares
+        // against a placeholder of the same shape rather than returning early.
+        let ok_cred: Option<CredAuth> = match cred {
+            Some(c) => constant_time_eq(password.as_bytes(), c.password.as_bytes()).then_some(c),
+            None => {
+                constant_time_eq(password.as_bytes(), UNKNOWN_CRED_PLACEHOLDER.as_bytes());
+                None
             }
-        })
-        .await?;
+        };
 
         match ok_cred {
             Some(c) => {
@@ -630,4 +626,12 @@ pub fn spawn_sweeper(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// Compare two secrets without giving away where they first differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

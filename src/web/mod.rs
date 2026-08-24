@@ -290,7 +290,6 @@ async fn login(State(state): State<Arc<AppState>>, Form(form): Form<AuthForm>) -
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(token) = session_token(&headers) {
         state.sessions.lock().expect("sessions mutex poisoned").remove(&token);
-        state.reveals.lock().expect("reveals mutex poisoned").remove(&token);
     }
     let clear = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     ([(header::SET_COOKIE, clear)], Redirect::to("/")).into_response()
@@ -309,16 +308,12 @@ async fn dashboard(
     };
     let creds = state.db.list_credentials(user.id).unwrap_or_default();
     let emails = state.mail.list(user.id);
-    let reveal = session_token(&headers).and_then(|t| {
-        state.reveals.lock().expect("reveals mutex poisoned").remove(&t)
-    });
     let (ok, err) = flash(&q);
     let settings = state.settings();
     let body = html::dashboard_page(
         &user,
         &creds,
         &emails,
-        reveal,
         &settings.endpoint(&settings.smtp_addr),
         &settings.endpoint(&settings.smtps_addr),
         &settings.hostname,
@@ -343,23 +338,11 @@ async fn cred_create(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             Alphanumeric.sample_string(&mut rng, 24),
         )
     };
-    let pass_clone = cred_pass.clone();
-    let hash = match tokio::task::spawn_blocking(move || hash_password(&pass_clone)).await {
-        Ok(Ok(h)) => h,
-        _ => return redirect_err("/dashboard", "Internal error, please try again"),
-    };
-    if let Err(e) = state.db.create_credential(user.id, &cred_user, &hash) {
+    if let Err(e) = state.db.create_credential(user.id, &cred_user, &cred_pass) {
         tracing::warn!("credential creation failed: {e:#}");
         return redirect_err("/dashboard", "Could not create credential, please try again");
     }
-    if let Some(token) = session_token(&headers) {
-        state
-            .reveals
-            .lock()
-            .expect("reveals mutex poisoned")
-            .insert(token, (cred_user, cred_pass));
-    }
-    Redirect::to("/dashboard").into_response()
+    redirect_ok("/dashboard", &format!("SMTP credential {cred_user} created"))
 }
 
 async fn cred_delete(

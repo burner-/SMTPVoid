@@ -100,8 +100,60 @@ textarea { resize:vertical; min-height:64px; }
         border-radius:6px; padding:10px 14px; margin:14px 0; font-size:13px; }
 .stack { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .stack form { margin:0; }
+.copyable { display:inline-flex; align-items:center; gap:6px; }
+.copy { margin:0; padding:2px 8px; font-size:12px; line-height:1.4; color:var(--muted); }
+.copy:hover { color:var(--text); }
+.copy.done { border-color:#1f6b34; background:#12351c; color:var(--green); }
 footer { max-width:1100px; margin:0 auto; padding:20px; color:var(--muted); font-size:13px;
          border-top:1px solid var(--border); }
+"#;
+
+/// Clipboard support for every `.copy` button on the page. The modern API only
+/// exists in a secure context, and this UI is often served over plain HTTP, so
+/// the old hidden-textarea trick stays as the fallback.
+const COPY_JS: &str = r#"
+document.addEventListener('click', function (e) {
+  var btn = e.target && e.target.closest && e.target.closest('button.copy');
+  if (!btn) return;
+  e.preventDefault();
+  var text = btn.getAttribute('data-copy') || '';
+  function done(ok) {
+    var label = btn.textContent;
+    btn.textContent = ok ? 'Copied' : 'Press Ctrl+C';
+    if (ok) btn.classList.add('done');
+    setTimeout(function () { btn.textContent = label; btn.classList.remove('done'); }, 1200);
+  }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    document.body.removeChild(ta);
+    // Nothing worked, so leave the value selected: then the Ctrl+C the button
+    // now suggests actually copies something.
+    if (!ok) {
+      var code = btn.parentElement && btn.parentElement.querySelector('code');
+      if (code) {
+        var range = document.createRange();
+        range.selectNodeContents(code);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    }
+    done(ok);
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(function () { done(true); }, fallback);
+  } else {
+    fallback();
+  }
+});
 "#;
 
 /// Navigation context for the layout.
@@ -146,9 +198,19 @@ pub fn layout(title: &str, nav: Nav, flash_ok: Option<&str>, flash_err: Option<&
 <header><div class="hwrap"><a class="logo" href="/">SMTP<span>Void</span></a>{nav_html}</div></header>
 <main>{flash}{body}</main>
 <footer>SMTPVoid is an SMTP testing sink. Messages are held in memory for a limited time and are <strong>never delivered anywhere</strong>.</footer>
+<script>{COPY_JS}</script>
 </body>
 </html>"#,
         title = esc(title),
+    )
+}
+
+/// A value the reader is meant to paste somewhere else: the text plus a button
+/// that puts it on the clipboard. The script behind it lives in [`layout`].
+pub fn copyable(value: &str) -> String {
+    format!(
+        r#"<span class="copyable"><code>{v}</code><button type="button" class="copy" data-copy="{v}" title="Copy to clipboard" aria-label="Copy to clipboard">Copy</button></span>"#,
+        v = esc(value)
     )
 }
 
@@ -225,7 +287,6 @@ pub fn dashboard_page(
     user: &User,
     creds: &[SmtpCredential],
     emails: &[Arc<StoredEmail>],
-    reveal: Option<(String, String)>,
     smtp_endpoint: &str,
     smtps_endpoint: &str,
     hostname: &str,
@@ -238,24 +299,6 @@ pub fn dashboard_page(
         esc(&user.username),
         fmt_duration(retention_secs)
     ));
-
-    if let Some((cu, cp)) = reveal {
-        out.push_str(&format!(
-            r#"<div class="reveal">
-<strong>New SMTP credential created.</strong> The password is shown only once &mdash; copy it now.
-<div class="kv" style="margin-top:10px">
-<dt>Server (plaintext/STARTTLS)</dt><dd><code>{smtp}</code></dd>
-<dt>Server (implicit TLS)</dt><dd><code>{smtps}</code></dd>
-<dt>Username</dt><dd><code>{cu}</code></dd>
-<dt>Password</dt><dd><code>{cp}</code></dd>
-<dt>Mechanisms</dt><dd><code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></dd>
-</div></div>"#,
-            smtp = esc(smtp_endpoint),
-            smtps = esc(smtps_endpoint),
-            cu = esc(&cu),
-            cp = esc(&cp),
-        ));
-    }
 
     // SMTP credentials. The connection details sit here rather than only in
     // the one-time reveal above, so they stay readable long after the
@@ -278,18 +321,19 @@ pub fn dashboard_page(
         out.push_str(r#"<table style="margin-top:18px"><tr><th>Username</th><th>Password</th><th>Created</th><th>Messages received</th><th>Last used</th><th></th></tr>"#);
         for c in creds {
             out.push_str(&format!(
-                r#"<tr><td><code>{}</code></td><td class="muted">shown once at creation</td><td>{}</td><td>{}</td><td>{}</td>
+                r#"<tr><td>{user}</td><td>{password}</td><td>{}</td><td>{}</td><td>{}</td>
 <td><form class="inline" method="post" action="/credentials/{}/delete" onsubmit="return confirm('Delete this SMTP credential?')"><button class="danger">Delete</button></form></td></tr>"#,
-                esc(&c.username),
                 fmt_ts(c.created_at),
                 c.total_messages,
                 c.last_used_at.map(fmt_ts).unwrap_or_else(|| "never".into()),
                 c.id,
+                user = copyable(&c.username),
+                password = copyable(&c.password),
             ));
         }
         out.push_str("</table>");
         out.push_str(
-            r#"<p class="muted small">Passwords are stored as hashes and cannot be shown again. Lost one? Delete that credential and create another.</p>"#,
+            r#"<p class="muted small">These passwords are shown in full because they can do exactly one thing: push mail into your own void mailbox, which is never delivered anywhere. Anyone signed in as you can read them.</p>"#,
         );
     }
     out.push_str(

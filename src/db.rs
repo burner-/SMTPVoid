@@ -26,6 +26,8 @@ pub struct User {
 pub struct SmtpCredential {
     pub id: i64,
     pub username: String,
+    /// The password itself, in the clear, for the dashboard to show.
+    pub password: String,
     pub created_at: i64,
     pub total_messages: i64,
     pub last_used_at: Option<i64>,
@@ -37,7 +39,7 @@ pub struct CredAuth {
     pub id: i64,
     pub user_id: i64,
     pub username: String,
-    pub password_hash: String,
+    pub password: String,
 }
 
 /// Per-user statistics row for the admin view. Never contains message content.
@@ -81,11 +83,15 @@ CREATE TABLE IF NOT EXISTS users (
     count_tls INTEGER NOT NULL DEFAULT 0,
     last_message_at INTEGER
 );
+-- An SMTP credential can only push mail into a virtual mailbox that is never
+-- delivered anywhere, so its password is kept in the clear and the dashboard
+-- shows it whenever the owner asks. Account passwords are a different matter
+-- and stay hashed, in users.password_hash above.
 CREATE TABLE IF NOT EXISTS smtp_credentials (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
+    password TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     total_messages INTEGER NOT NULL DEFAULT 0,
     last_used_at INTEGER
@@ -107,6 +113,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_credential_passwords(&conn)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -236,11 +243,11 @@ impl Db {
 
     // ---- SMTP credentials ----
 
-    pub fn create_credential(&self, user_id: i64, username: &str, password_hash: &str) -> Result<i64> {
+    pub fn create_credential(&self, user_id: i64, username: &str, password: &str) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO smtp_credentials (user_id, username, password_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![user_id, username, password_hash, now_unix()],
+            "INSERT INTO smtp_credentials (user_id, username, password, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, username, password, now_unix()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -258,7 +265,7 @@ impl Db {
     pub fn list_credentials(&self, user_id: i64) -> Result<Vec<SmtpCredential>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, username, created_at, total_messages, last_used_at
+            "SELECT id, username, password, created_at, total_messages, last_used_at
              FROM smtp_credentials WHERE user_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -266,9 +273,10 @@ impl Db {
                 Ok(SmtpCredential {
                     id: r.get(0)?,
                     username: r.get(1)?,
-                    created_at: r.get(2)?,
-                    total_messages: r.get(3)?,
-                    last_used_at: r.get(4)?,
+                    password: r.get(2)?,
+                    created_at: r.get(3)?,
+                    total_messages: r.get(4)?,
+                    last_used_at: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -289,14 +297,14 @@ impl Db {
         let conn = self.lock();
         let cred = conn
             .query_row(
-                "SELECT id, user_id, username, password_hash FROM smtp_credentials WHERE username = ?1",
+                "SELECT id, user_id, username, password FROM smtp_credentials WHERE username = ?1",
                 params![username],
                 |r| {
                     Ok(CredAuth {
                         id: r.get(0)?,
                         user_id: r.get(1)?,
                         username: r.get(2)?,
-                        password_hash: r.get(3)?,
+                        password: r.get(3)?,
                     })
                 },
             )
@@ -390,4 +398,41 @@ impl Db {
         }
         Ok(stats)
     }
+}
+
+/// Credential passwords used to be stored only as an argon2 hash, so the
+/// dashboard could show one exactly once. They live in the clear now, and a
+/// hash cannot be turned back into the password it came from, so an older
+/// database has its credentials removed rather than carrying rows the UI could
+/// never show. Users make new ones from the dashboard; nothing else is touched.
+fn migrate_credential_passwords(conn: &Connection) -> Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('smtp_credentials') WHERE name = 'password'")?
+        .exists([])?;
+    if has_column {
+        return Ok(());
+    }
+    let dropped: i64 =
+        conn.query_row("SELECT COUNT(*) FROM smtp_credentials", [], |r| r.get(0))?;
+    conn.execute_batch(
+        "BEGIN;
+         DROP TABLE smtp_credentials;
+         CREATE TABLE smtp_credentials (
+             id INTEGER PRIMARY KEY,
+             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             username TEXT NOT NULL UNIQUE,
+             password TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             total_messages INTEGER NOT NULL DEFAULT 0,
+             last_used_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_creds_user ON smtp_credentials(user_id);
+         COMMIT;",
+    )?;
+    if dropped > 0 {
+        tracing::warn!(
+            "removed {dropped} SMTP credential(s) that only had a hashed password; their owners create new ones from the dashboard"
+        );
+    }
+    Ok(())
 }

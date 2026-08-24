@@ -13,8 +13,10 @@ delivered or relayed**.
 
 - **Open registration** — anyone can create an account through the web UI (can be
   closed from the admin settings).
-- **SMTP credentials** — each user generates credentials (random username + password,
-  shown once) for authenticating SMTP submissions.
+- **SMTP credentials** — each user generates credentials (random username + password)
+  for authenticating SMTP submissions. The dashboard keeps showing the password,
+  with a copy button next to both halves: a credential can only push mail into its
+  owner's void mailbox, so there is nothing to protect it from.
 - **Account password** — every user changes their own sign-in password from the
   account page, reached by clicking their username in the header; doing so ends
   their other browser sessions.
@@ -182,7 +184,13 @@ sudo ./install-ubuntu.sh --pull
 
 Every run rebuilds, reinstalls the binary and the unit, and restarts the
 service, whether or not anything changed — the data directory (database, TLS
-material, ACME state) is never touched. The closing summary says which parts
+material, ACME state) is never touched.
+
+> **Upgrading past the plaintext-credential change:** SMTP credentials created
+> while passwords were hashed cannot be recovered, so the first start after that
+> change deletes them and logs how many went. Accounts, settings and statistics
+> are untouched; users create new credentials from the dashboard.
+ The closing summary says which parts
 were actually updated, when the service restarted and which revision it was
 built from, and it warns if the running process is not the binary that was just
 installed.
@@ -247,7 +255,11 @@ cargo run --example smoke_client -- tls      localhost:465 <user> <pass>
   an in-memory store and expire.
 - Message bodies never touch disk; only counters (message/byte counts per user) are
   persisted for statistics.
-- Passwords (accounts and SMTP credentials) are stored as argon2id hashes.
+- Account passwords are stored as argon2id hashes. SMTP credential passwords are
+  stored in the clear on purpose: they are server-generated random strings whose
+  only power is to submit mail into the sender's own mailbox, which is never
+  delivered or relayed. Leaking one lets somebody clutter that mailbox, nothing
+  more.
 - SMTP requires authentication before `MAIL FROM`; unauthenticated sessions cannot
   submit anything.
 - Session cookies are `HttpOnly` + `SameSite=Strict`; registration is rate-limited
