@@ -16,7 +16,8 @@ delivered or relayed**.
 - **SMTP credentials** — each user generates credentials (random username + password,
   shown once) for authenticating SMTP submissions.
 - **Account password** — every user changes their own sign-in password from the
-  Account section of the dashboard; doing so ends their other browser sessions.
+  account page, reached by clicking their username in the header; doing so ends
+  their other browser sessions.
   If nobody can sign in any more, `smtpvoid set-password <user>` resets one from
   the command line (the password is read from stdin, never from an argument).
 - **Virtual mailbox** — captured messages appear in the web UI with parsed headers,
@@ -63,13 +64,13 @@ listeners to new addresses, which happens without dropping the process.
 
 | Setting | Default | Description |
 |---|---|---|
-| SMTP hostname | `smtpvoid.local` | Hostname in the SMTP banner and the self-signed certificate |
+| SMTP hostname | `smtpvoid.local` | Hostname in the SMTP banner, in the self-signed certificate, and in the connection details shown to users |
 | SMTP address | `0.0.0.0:587` | Submission listener (plaintext, offers STARTTLS) |
 | SMTPS address | `0.0.0.0:465` | Implicit-TLS submission listener |
 | HTTPS web UI address | *(empty)* | Serves the UI over TLS with the same certificate; empty disables it |
 | Retention | `3600` s | How long messages are kept; re-dates mail already in the store |
 | Messages per mailbox | `100` | Oldest evicted past this |
-| Max message size | `1048576` | Bytes; advertised via the ESMTP `SIZE` extension |
+| Max message size | `1` MiB | Advertised via the ESMTP `SIZE` extension; stored in bytes, edited in MiB |
 | SMTP credentials per user | `20` | Credential pairs one account may hold |
 | Open registration | on | When off, nobody can self-register |
 | Session cookie `Secure` | off | Turn on once the UI is HTTPS-only |

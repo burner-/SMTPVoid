@@ -8,7 +8,7 @@ use crate::config::{fmt_bytes, fmt_duration, fmt_ts, now_unix, BootConfig};
 use crate::db::{AdminUserRow, GlobalStats, SmtpCredential, User};
 use crate::listeners::Kind as ListenerKind;
 use crate::mailstore::{ConnKind, StoredEmail};
-use crate::settings::{Settings, LETSENCRYPT_PRODUCTION, LETSENCRYPT_STAGING};
+use crate::settings::{bytes_as_mib, Settings, LETSENCRYPT_PRODUCTION, LETSENCRYPT_STAGING};
 use crate::tls::{CertInfo, CertSource};
 
 /// HTML-escape untrusted text.
@@ -41,6 +41,7 @@ header { border-bottom:1px solid var(--border); background:var(--panel); }
 .logo span { color:var(--accent); }
 nav { display:flex; gap:14px; margin-left:auto; align-items:center; }
 nav .who { color:var(--muted); }
+nav a.who:hover { color:var(--text); }
 main { max-width:1100px; margin:0 auto; padding:24px 20px 60px; }
 h1 { font-size:24px; margin:0 0 6px; }
 h2 { font-size:18px; margin:28px 0 10px; }
@@ -121,7 +122,7 @@ pub fn layout(title: &str, nav: Nav, flash_ok: Option<&str>, flash_err: Option<&
                 ""
             };
             format!(
-                r#"<nav><a href="/dashboard">Dashboard</a>{admin}<span class="who">{}</span>
+                r#"<nav><a href="/dashboard">Dashboard</a>{admin}<a class="who" href="/account" title="Your account">{}</a>
                 <form class="inline" method="post" action="/logout"><button style="margin:0;padding:4px 12px">Sign out</button></form></nav>"#,
                 esc(&u.username)
             )
@@ -160,8 +161,8 @@ pub fn badge(kind: ConnKind) -> &'static str {
 }
 
 pub fn index_page(
-    smtp_addr: &str,
-    smtps_addr: &str,
+    smtp_endpoint: &str,
+    smtps_endpoint: &str,
     retention_secs: i64,
     registration_open: bool,
 ) -> String {
@@ -195,8 +196,8 @@ pub fn index_page(
 </div>
 {actions}"#,
         retention = fmt_duration(retention_secs),
-        smtp = esc(smtp_addr),
-        smtps = esc(smtps_addr),
+        smtp = esc(smtp_endpoint),
+        smtps = esc(smtps_endpoint),
     )
 }
 
@@ -225,8 +226,8 @@ pub fn dashboard_page(
     creds: &[SmtpCredential],
     emails: &[Arc<StoredEmail>],
     reveal: Option<(String, String)>,
-    smtp_addr: &str,
-    smtps_addr: &str,
+    smtp_endpoint: &str,
+    smtps_endpoint: &str,
     hostname: &str,
     retention_secs: i64,
 ) -> String {
@@ -245,28 +246,39 @@ pub fn dashboard_page(
 <div class="kv" style="margin-top:10px">
 <dt>Server (plaintext/STARTTLS)</dt><dd><code>{smtp}</code></dd>
 <dt>Server (implicit TLS)</dt><dd><code>{smtps}</code></dd>
-<dt>Hostname</dt><dd><code>{host}</code></dd>
 <dt>Username</dt><dd><code>{cu}</code></dd>
 <dt>Password</dt><dd><code>{cp}</code></dd>
 <dt>Mechanisms</dt><dd><code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></dd>
 </div></div>"#,
-            smtp = esc(smtp_addr),
-            smtps = esc(smtps_addr),
-            host = esc(hostname),
+            smtp = esc(smtp_endpoint),
+            smtps = esc(smtps_endpoint),
             cu = esc(&cu),
             cp = esc(&cp),
         ));
     }
 
-    // SMTP credentials
-    out.push_str("<h2>SMTP credentials</h2><div class=\"panel\">");
+    // SMTP credentials. The connection details sit here rather than only in
+    // the one-time reveal above, so they stay readable long after the
+    // credential was created.
+    out.push_str(&format!(
+        r#"<h2>SMTP credentials</h2><div class="panel">
+<div class="kv">
+<dt>Server (plaintext/STARTTLS)</dt><dd><code>{smtp}</code></dd>
+<dt>Server (implicit TLS)</dt><dd><code>{smtps}</code></dd>
+<dt>Hostname</dt><dd><code>{host}</code></dd>
+<dt>Mechanisms</dt><dd><code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></dd>
+</div>"#,
+        smtp = esc(smtp_endpoint),
+        smtps = esc(smtps_endpoint),
+        host = esc(hostname),
+    ));
     if creds.is_empty() {
-        out.push_str(r#"<p class="muted">No SMTP credentials yet. Create one to start sending mail into the void.</p>"#);
+        out.push_str(r#"<p class="muted" style="margin-bottom:0">No SMTP credentials yet. Create one to start sending mail into the void.</p>"#);
     } else {
-        out.push_str("<table><tr><th>Username</th><th>Created</th><th>Messages received</th><th>Last used</th><th></th></tr>");
+        out.push_str(r#"<table style="margin-top:18px"><tr><th>Username</th><th>Password</th><th>Created</th><th>Messages received</th><th>Last used</th><th></th></tr>"#);
         for c in creds {
             out.push_str(&format!(
-                r#"<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>
+                r#"<tr><td><code>{}</code></td><td class="muted">shown once at creation</td><td>{}</td><td>{}</td><td>{}</td>
 <td><form class="inline" method="post" action="/credentials/{}/delete" onsubmit="return confirm('Delete this SMTP credential?')"><button class="danger">Delete</button></form></td></tr>"#,
                 esc(&c.username),
                 fmt_ts(c.created_at),
@@ -276,6 +288,9 @@ pub fn dashboard_page(
             ));
         }
         out.push_str("</table>");
+        out.push_str(
+            r#"<p class="muted small">Passwords are stored as hashes and cannot be shown again. Lost one? Delete that credential and create another.</p>"#,
+        );
     }
     out.push_str(
         r#"<form method="post" action="/credentials/create"><button class="primary">Create SMTP credential</button></form></div>"#,
@@ -315,10 +330,21 @@ pub fn dashboard_page(
     }
     out.push_str("</div>");
 
-    // Account
-    out.push_str(
-        r#"<h2>Account</h2><div class="panel">
-<p class="muted small">Changing your sign-in password signs out every other browser. SMTP credentials are separate and keep working.</p>
+    out
+}
+
+/// The signed-in user's own profile, reached by clicking the username in the
+/// header. Sign-in details only; SMTP credentials stay on the dashboard.
+pub fn account_page(user: &User) -> String {
+    format!(
+        r#"<h1>Account</h1>
+<p class="sub">Your sign-in details. SMTP credentials are separate passwords and live on the <a href="/dashboard">dashboard</a>.</p>
+<div class="panel"><div class="kv">
+<dt>Username</dt><dd><strong>{name}</strong></dd>
+<dt>Role</dt><dd>{role}</dd>
+</div></div>
+<h2>Change password</h2><div class="panel">
+<p class="muted small" style="margin-top:0">Changing your sign-in password signs out every other browser. SMTP credentials keep working.</p>
 <form method="post" action="/account/password" style="max-width:420px">
 <label for="current_password">Current password</label>
 <input type="password" id="current_password" name="current_password" required maxlength="128" autocomplete="current-password">
@@ -328,8 +354,13 @@ pub fn dashboard_page(
 <input type="password" id="confirm_password" name="confirm_password" required minlength="8" maxlength="128" autocomplete="new-password">
 <button class="primary">Change password</button>
 </form></div>"#,
-    );
-    out
+        name = esc(&user.username),
+        role = if user.is_admin {
+            r#"<span class="badge b-admin">admin</span>"#
+        } else {
+            "user"
+        },
+    )
 }
 
 pub fn mail_page(e: &StoredEmail) -> String {
@@ -530,6 +561,19 @@ fn num_field(id: &str, label: &str, value: impl std::fmt::Display, hint: &str) -
         id = esc(id),
         label = esc(label),
         value = esc(&value.to_string()),
+        hint = esc(hint),
+    )
+}
+
+/// A byte count edited in mebibytes. Fractions are allowed so the low end of
+/// the range (1 KiB) stays reachable, hence `step="any"`.
+fn mib_field(id: &str, label: &str, bytes: usize, hint: &str) -> String {
+    format!(
+        r#"<div class="field"><label for="{id}">{label}</label>
+<input type="number" id="{id}" name="{id}" value="{value}" step="any" min="0"><p class="hint">{hint}</p></div>"#,
+        id = esc(id),
+        label = esc(label),
+        value = esc(&bytes_as_mib(bytes)),
         hint = esc(hint),
     )
 }
@@ -742,11 +786,11 @@ pub fn settings_page(
             s.mailbox_cap,
             "The oldest message is evicted once a mailbox is full.",
         ),
-        maxsize = num_field(
+        maxsize = mib_field(
             "max_message_size",
-            "Max message size (bytes)",
+            "Max message size (MiB)",
             s.max_message_size,
-            "Advertised to clients via the ESMTP SIZE extension.",
+            "Advertised to clients via the ESMTP SIZE extension. 1 MiB is 1048576 bytes; anything from 0.001 to 256 is accepted.",
         ),
         maxcreds = num_field(
             "max_credentials_per_user",

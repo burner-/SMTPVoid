@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 
 use crate::config::now_unix;
 use crate::db::User;
-use crate::settings::{parse_domains, Settings};
+use crate::settings::{mib_as_bytes, parse_domains, Settings};
 use crate::state::{AppState, WebSession, SESSION_TTL_SECS};
 use crate::web::tls_listener::TlsListener;
 
@@ -143,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mail/{id}/raw", get(mail_raw))
         .route("/mail/{id}/delete", post(mail_delete))
         .route("/mailbox/clear", post(mailbox_clear))
+        .route("/account", get(account_view))
         .route("/account/password", post(account_password))
         .route("/setup", get(setup_form).post(setup_submit))
         .route("/admin", get(admin_view))
@@ -183,8 +184,8 @@ pub async fn serve_https(state: Arc<AppState>, listener: TcpListener) -> Result<
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let settings = state.settings();
     let body = html::index_page(
-        &settings.smtp_addr,
-        &settings.smtps_addr,
+        &settings.endpoint(&settings.smtp_addr),
+        &settings.endpoint(&settings.smtps_addr),
         settings.retention_secs as i64,
         settings.registration_open,
     );
@@ -318,8 +319,8 @@ async fn dashboard(
         &creds,
         &emails,
         reveal,
-        &settings.smtp_addr,
-        &settings.smtps_addr,
+        &settings.endpoint(&settings.smtp_addr),
+        &settings.endpoint(&settings.smtps_addr),
         &settings.hostname,
         settings.retention_secs as i64,
     );
@@ -439,6 +440,22 @@ async fn mailbox_clear(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     redirect_ok("/dashboard", "Mailbox emptied")
 }
 
+/// The signed-in user's own account page, linked from the username in the
+/// header.
+async fn account_view(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let user = match current_user(&state, &headers) {
+        Some(u) => u,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let (ok, err) = flash(&q);
+    let body = html::account_page(&user);
+    Html(html::layout("Account", html::Nav::User(&user), ok, err, &body)).into_response()
+}
+
 #[derive(Deserialize)]
 struct PasswordForm {
     current_password: String,
@@ -458,13 +475,13 @@ async fn account_password(
         None => return Redirect::to("/login").into_response(),
     };
     if form.new_password != form.confirm_password {
-        return redirect_err("/dashboard", "The two new passwords do not match");
+        return redirect_err("/account", "The two new passwords do not match");
     }
     if form.new_password.len() < 8 || form.new_password.len() > 128 {
-        return redirect_err("/dashboard", "Password must be 8-128 characters");
+        return redirect_err("/account", "Password must be 8-128 characters");
     }
     if form.new_password == form.current_password {
-        return redirect_err("/dashboard", "The new password is the same as the old one");
+        return redirect_err("/account", "The new password is the same as the old one");
     }
     // Two argon2 operations - verifying the old password and hashing the new
     // one - so both go to the blocking pool, like every other hash here.
@@ -477,8 +494,8 @@ async fn account_password(
     .await;
     let hashed = match hashed {
         Ok(Some(Ok(h))) => h,
-        Ok(None) => return redirect_err("/dashboard", "Current password is not correct"),
-        _ => return redirect_err("/dashboard", "Internal error, please try again"),
+        Ok(None) => return redirect_err("/account", "Current password is not correct"),
+        _ => return redirect_err("/account", "Internal error, please try again"),
     };
     match state.db.set_password(user.id, &hashed) {
         Ok(true) => {
@@ -486,12 +503,12 @@ async fn account_password(
             // but keep this one so the change does not sign the user out.
             state.drop_user_sessions(user.id, session_token(&headers).as_deref());
             tracing::info!("password changed for user '{}' (id {})", user.username, user.id);
-            redirect_ok("/dashboard", "Password changed")
+            redirect_ok("/account", "Password changed")
         }
-        Ok(false) => redirect_err("/dashboard", "Account no longer exists"),
+        Ok(false) => redirect_err("/account", "Account no longer exists"),
         Err(e) => {
             tracing::warn!("password change failed for user id {}: {e:#}", user.id);
-            redirect_err("/dashboard", "Could not change the password, please try again")
+            redirect_err("/account", "Could not change the password, please try again")
         }
     }
 }
@@ -686,7 +703,9 @@ impl SettingsForm {
             https_addr: self.https_addr.trim().to_string(),
             retention_secs: parse_num("Retention", &self.retention_secs)?,
             mailbox_cap: parse_num("Mailbox capacity", &self.mailbox_cap)?,
-            max_message_size: parse_num("Max message size", &self.max_message_size)?,
+            // The form field is in MiB; everything else here works in bytes.
+            max_message_size: mib_as_bytes(&self.max_message_size)
+                .ok_or("Max message size must be a number of mebibytes")?,
             max_credentials_per_user: parse_num(
                 "Credentials per user",
                 &self.max_credentials_per_user,

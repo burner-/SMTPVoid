@@ -192,6 +192,17 @@ impl Settings {
         }
     }
 
+    /// What a mail client should be told to connect to for a listener: the
+    /// announced hostname with that listener's port. The bind address itself
+    /// names a local interface (`0.0.0.0:587` and friends) and is meaningless
+    /// to anyone on the other end of the connection.
+    pub fn endpoint(&self, bind_addr: &str) -> String {
+        match port_of(bind_addr) {
+            Some(port) => format!("{}:{port}", self.hostname),
+            None => self.hostname.clone(),
+        }
+    }
+
     /// Reject anything that would break the server or lock the admin out.
     /// Returns a human-readable message describing the first problem found.
     pub fn validate(&self) -> Result<(), String> {
@@ -256,6 +267,41 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// The message-size limit is stored (and advertised over SMTP) in bytes, but
+/// the settings form edits it in mebibytes, which is how operators think of it.
+pub const MIB: usize = 1024 * 1024;
+
+/// A byte count as the MiB number to put in a form field. Six decimals resolve
+/// to about a byte, so a value that was never edited comes back unchanged.
+pub fn bytes_as_mib(bytes: usize) -> String {
+    let text = format!("{:.6}", bytes as f64 / MIB as f64);
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() { "0" } else { trimmed }.to_string()
+}
+
+/// The inverse of [`bytes_as_mib`]. `None` for anything that is not a
+/// non-negative number; the range itself is left to [`Settings::validate`].
+pub fn mib_as_bytes(raw: &str) -> Option<usize> {
+    let mib = raw.trim().parse::<f64>().ok()?;
+    if !mib.is_finite() || mib < 0.0 {
+        return None;
+    }
+    let bytes = (mib * MIB as f64).round();
+    if bytes > usize::MAX as f64 {
+        return None;
+    }
+    Some(bytes as usize)
+}
+
+/// The port half of a `host:port` bind address, if it has a usable one.
+fn port_of(addr: &str) -> Option<u16> {
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|p| *p > 0)
 }
 
 fn bool_str(b: bool) -> String {
@@ -357,6 +403,34 @@ mod tests {
         assert!(s.validate().is_err(), "terms not agreed");
         s.acme_tos_agreed = true;
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn message_size_round_trips_through_the_mib_field() {
+        for bytes in [1024_usize, 1_048_576, 1_572_864, 1_000_000, 256 * 1024 * 1024] {
+            let shown = bytes_as_mib(bytes);
+            assert_eq!(mib_as_bytes(&shown), Some(bytes), "{bytes} shown as {shown}");
+        }
+        assert_eq!(bytes_as_mib(1_048_576), "1");
+        assert_eq!(bytes_as_mib(1_572_864), "1.5");
+        assert_eq!(mib_as_bytes(" 2 "), Some(2 * 1024 * 1024));
+        assert_eq!(mib_as_bytes("half a meg"), None);
+        assert_eq!(mib_as_bytes("-1"), None);
+    }
+
+    #[test]
+    fn endpoint_pairs_the_hostname_with_the_listener_port() {
+        let s = Settings {
+            hostname: "mail.example.com".into(),
+            smtp_addr: "0.0.0.0:587".into(),
+            smtps_addr: "[::]:465".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.endpoint(&s.smtp_addr), "mail.example.com:587");
+        assert_eq!(s.endpoint(&s.smtps_addr), "mail.example.com:465");
+        // Nothing usable to append: better a bare hostname than "host:".
+        assert_eq!(s.endpoint(""), "mail.example.com");
+        assert_eq!(s.endpoint("0.0.0.0:0"), "mail.example.com");
     }
 
     #[test]
