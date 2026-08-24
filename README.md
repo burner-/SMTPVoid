@@ -123,7 +123,26 @@ are otherwise identical.
 
 ## Deployment (Linux)
 
-A container image and a systemd unit are provided:
+### Ubuntu / Debian installer
+
+[install-ubuntu.sh](install-ubuntu.sh) does the whole thing on a fresh Ubuntu or
+Debian host: installs the build dependencies and a current Rust toolchain,
+builds the release binary, creates the `smtpvoid` system user and
+`/var/lib/smtpvoid`, installs the systemd unit, enables it at boot and prints
+the admin setup token.
+
+```bash
+sudo ./install-ubuntu.sh
+```
+
+It is idempotent — run it again after `git pull` to rebuild and restart without
+touching the data directory. `--data-dir`, `--http-addr`, `--user`, `--prefix`,
+`--binary` (skip the build), `--open-firewall` and `--no-start` are available;
+see `./install-ubuntu.sh --help`.
+
+### Container
+
+A container image and a systemd unit are also provided:
 
 ```bash
 docker build -t smtpvoid .
