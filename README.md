@@ -15,6 +15,10 @@ delivered or relayed**.
   closed from the admin settings).
 - **SMTP credentials** — each user generates credentials (random username + password,
   shown once) for authenticating SMTP submissions.
+- **Account password** — every user changes their own sign-in password from the
+  Account section of the dashboard; doing so ends their other browser sessions.
+  If nobody can sign in any more, `smtpvoid set-password <user>` resets one from
+  the command line (the password is read from stdin, never from an argument).
 - **Virtual mailbox** — captured messages appear in the web UI with parsed headers,
   text/HTML bodies and raw source.
 - **Connection transparency** — every message records how it arrived: plaintext,
@@ -82,6 +86,28 @@ the page that fixes it:
 | `SMTPVOID_HTTP_ADDR` | `0.0.0.0:8080` | Plaintext web UI address; bound at startup and never moved |
 | `RUST_LOG` | `info` | Log filter (`tracing_subscriber` syntax) |
 
+### Setting the domain in one place
+
+The domain appears twice in the settings form — as the SMTP hostname and, when
+Let's Encrypt is on, in the certificate's domain list. For provisioning there is
+a one-shot command that writes both from a single value, so an installer never
+has to ask twice:
+
+```bash
+smtpvoid set-domain mail.example.com \
+  --letsencrypt --agree-tos --email ops@example.com --https-addr 0.0.0.0:443
+```
+
+The first domain becomes the SMTP hostname; every domain listed goes on the
+certificate. `--letsencrypt` requires `--agree-tos`, because ordering a
+certificate accepts the CA's terms of service; `--staging` picks the staging
+directory. Without `--letsencrypt` the command just sets the hostname — and
+retargets the ACME domains if that was already configured.
+
+It writes the same database rows the settings form writes, works before the
+first start, and reissues the self-signed certificate when the name changes. A
+running server keeps its cached settings until it is restarted.
+
 ### Ports and privileges
 
 SMTPVoid is a *submission* server — it requires `AUTH` before `MAIL FROM` and
@@ -135,10 +161,20 @@ the admin setup token.
 sudo ./install-ubuntu.sh
 ```
 
-It is idempotent — run it again after `git pull` to rebuild and restart without
+Give it the domain once and it configures the SMTP hostname, the certificate
+and the ACME order for you, so the settings form has nothing domain-shaped left
+in it:
+
+```bash
+sudo ./install-ubuntu.sh --domain mail.example.com \
+  --letsencrypt --agree-tos --email ops@example.com --https
+```
+
+Repeat `--domain` to put more names on the certificate. The installer is
+idempotent — run it again after `git pull` to rebuild and restart without
 touching the data directory. `--data-dir`, `--http-addr`, `--user`, `--prefix`,
-`--binary` (skip the build), `--open-firewall` and `--no-start` are available;
-see `./install-ubuntu.sh --help`.
+`--binary` (skip the build), `--acme-staging`, `--open-firewall` and
+`--no-start` are available too; see `./install-ubuntu.sh --help`.
 
 ### Container
 

@@ -212,6 +212,16 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Grant or revoke admin rights.
+    pub fn set_admin(&self, user_id: i64, is_admin: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE users SET is_admin = ?2 WHERE id = ?1",
+            params![user_id, is_admin as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn admin_exists(&self) -> Result<bool> {
         let conn = self.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| r.get(0))?;

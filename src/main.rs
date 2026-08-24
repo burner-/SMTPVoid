@@ -8,6 +8,7 @@
 //! configured from the admin UI at `/admin/settings` and stored in SQLite.
 
 mod acme;
+mod cli;
 mod config;
 mod db;
 mod listeners;
@@ -31,6 +32,20 @@ use crate::tls::CertStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // A few provisioning commands run without starting anything, so they are
+    // dispatched before the logger and the listeners exist.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("set-domain") => return cli::set_domain(&args[1..]),
+        Some("set-password") => return cli::set_password(&args[1..]),
+        Some("--help" | "-h" | "help") => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("unknown argument {other}\n\n{}", cli::USAGE),
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -23,6 +23,12 @@ UNIT_DIR=/etc/systemd/system
 PREBUILT_BINARY=
 OPEN_FIREWALL=0
 START_SERVICE=1
+DOMAINS=
+LETSENCRYPT=0
+AGREE_TOS=0
+ACME_STAGING=0
+ACME_EMAIL=
+HTTPS_ADDR=
 
 # axum 0.8 and the ACME stack need a newer compiler than Ubuntu 24.04 or Debian
 # bookworm ship, so an older distro toolchain is bypassed in favour of rustup.
@@ -42,6 +48,15 @@ Install SMTPVoid as a systemd service on Ubuntu or Debian.
 Usage: sudo ./install-ubuntu.sh [options]
 
 Options:
+  --domain DOMAIN      the server's domain, given once: it becomes the SMTP
+                       hostname, the certificate name and, with --letsencrypt,
+                       the domain the certificate is ordered for. Repeat the
+                       option to put more names on the certificate.
+  --letsencrypt        order a Let's Encrypt certificate for those domains
+  --agree-tos          accept the CA's terms of service (required with --letsencrypt)
+  --email ADDR         contact address to register with the CA
+  --acme-staging       use the Let's Encrypt staging directory while testing
+  --https              also serve the web UI over TLS on 0.0.0.0:443
   --user NAME          system account to run as (default: smtpvoid)
   --data-dir PATH      database, TLS material, ACME state (default: /var/lib/smtpvoid)
   --http-addr ADDR     plaintext web UI address (default: 0.0.0.0:8080)
@@ -51,13 +66,23 @@ Options:
   --no-start           install and enable the unit but do not start it now
   -h, --help           show this help
 
-Everything else - hostname, listener addresses, retention, Let's Encrypt - is
-configured in the web UI at /admin/settings after the first start.
+Example:
+  sudo ./install-ubuntu.sh --domain mail.example.com \
+       --letsencrypt --agree-tos --email ops@example.com --https
+
+Everything else - listener addresses, retention, limits - is configured in the
+web UI at /admin/settings after the first start.
 USAGE
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --domain)         DOMAINS="$DOMAINS ${2:?--domain needs a value}"; shift 2 ;;
+        --letsencrypt)    LETSENCRYPT=1; shift ;;
+        --agree-tos)      AGREE_TOS=1; shift ;;
+        --email)          ACME_EMAIL=${2:?--email needs a value}; shift 2 ;;
+        --acme-staging)   ACME_STAGING=1; shift ;;
+        --https)          HTTPS_ADDR=0.0.0.0:443; shift ;;
         --user)           SERVICE_USER=${2:?--user needs a value}; shift 2 ;;
         --data-dir)       DATA_DIR=${2:?--data-dir needs a value}; shift 2 ;;
         --http-addr)      HTTP_ADDR=${2:?--http-addr needs a value}; shift 2 ;;
@@ -71,6 +96,17 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------- preflight
+
+DOMAINS=${DOMAINS# }
+if [ -z "$DOMAINS" ]; then
+    [ "$LETSENCRYPT" -eq 0 ] || die "--letsencrypt needs --domain"
+    [ -z "$ACME_EMAIL" ]     || die "--email needs --domain"
+    [ "$ACME_STAGING" -eq 0 ] || die "--acme-staging needs --domain"
+    [ -z "$HTTPS_ADDR" ]     || die "--https needs --domain"
+fi
+if [ "$LETSENCRYPT" -eq 1 ] && [ "$AGREE_TOS" -eq 0 ]; then
+    die "--letsencrypt also needs --agree-tos: ordering a certificate accepts the CA's terms of service on your behalf"
+fi
 
 [ "$(id -u)" -eq 0 ]            || die "run this as root, e.g. sudo $0"
 command -v apt-get >/dev/null   || die "no apt-get - this script targets Ubuntu and Debian"
@@ -196,6 +232,33 @@ chmod 0644 "$UNIT_DIR/smtpvoid.service"
 
 systemctl daemon-reload
 
+# ---------------------------------------------------------------- the domain
+
+# The admin UI wants the domain in two fields (the SMTP hostname and the
+# certificate domains), so the binary has a one-shot command that writes both
+# from a single value. It runs as the service user, before the first start, so
+# the database it creates is owned correctly and the server comes up already
+# knowing its own name.
+if [ -n "$DOMAINS" ]; then
+    # Deliberately unquoted: --domain may be repeated and collects into one
+    # space-separated list, which becomes one argument per domain here.
+    # shellcheck disable=SC2086
+    set -- $DOMAINS
+    if [ "$LETSENCRYPT" -eq 1 ];  then set -- "$@" --letsencrypt --agree-tos; fi
+    if [ "$ACME_STAGING" -eq 1 ]; then set -- "$@" --staging; fi
+    if [ -n "$ACME_EMAIL" ];      then set -- "$@" --email "$ACME_EMAIL"; fi
+    if [ -n "$HTTPS_ADDR" ];      then set -- "$@" --https-addr "$HTTPS_ADDR"; fi
+
+    say "Setting the domain"
+    if command -v runuser >/dev/null; then
+        runuser -u "$SERVICE_USER" -- \
+            env SMTPVOID_DATA_DIR="$DATA_DIR" "$TARGET_BINARY" set-domain "$@"
+    else
+        env SMTPVOID_DATA_DIR="$DATA_DIR" "$TARGET_BINARY" set-domain "$@"
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+    fi
+fi
+
 # ----------------------------------------------------------------- firewall
 
 if [ "$OPEN_FIREWALL" -eq 1 ]; then
@@ -233,8 +296,12 @@ if ! systemctl is-active --quiet smtpvoid; then
     exit 1
 fi
 
-HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
-[ -n "$HOST" ] || HOST=localhost
+if [ -n "$DOMAINS" ]; then
+    HOST=${DOMAINS%% *}
+else
+    HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$HOST" ] || HOST=localhost
+fi
 PORT=${HTTP_ADDR##*:}
 
 echo
@@ -243,6 +310,14 @@ echo
 echo "  Web UI     http://$HOST:$PORT/"
 echo "  Data dir   $DATA_DIR"
 echo "  Logs       journalctl -u smtpvoid -f"
+if [ -n "$DOMAINS" ]; then
+    echo "  Domain     ${DOMAINS%% *} (SMTP hostname and certificate name)"
+fi
+if [ "$LETSENCRYPT" -eq 1 ]; then
+    echo "  Let's Encrypt is on: the certificate is ordered in the background, and"
+    echo "  every domain must resolve to this host and reach port 80. Watch the log,"
+    echo "  or the certificate panel under Settings, for the result."
+fi
 echo
 
 if [ -s "$DATA_DIR/admin_setup_token" ]; then
@@ -250,8 +325,8 @@ if [ -s "$DATA_DIR/admin_setup_token" ]; then
     echo
     echo "      setup token: $(cat "$DATA_DIR/admin_setup_token")"
     echo
-    echo "  Then set the hostname, listener addresses and Let's Encrypt options under"
-    echo "  Settings. The token stops working as soon as the admin account exists."
+    echo "  The token stops working as soon as the admin account exists. Listener"
+    echo "  addresses, retention and the rest are under Settings."
 else
     echo "  An admin account already exists - sign in and continue at /admin/settings."
 fi
