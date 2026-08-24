@@ -202,6 +202,16 @@ impl Db {
         Ok(user)
     }
 
+    /// Replace a user's web password. Returns false when the row is gone.
+    pub fn set_password(&self, user_id: i64, password_hash: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE users SET password_hash = ?2 WHERE id = ?1",
+            params![user_id, password_hash],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn admin_exists(&self) -> Result<bool> {
         let conn = self.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| r.get(0))?;

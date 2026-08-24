@@ -97,6 +97,13 @@ impl AppState {
         Some(s.user_id)
     }
 
+    /// Drop every web session belonging to a user, except an optional one to
+    /// keep. Called after a password change so an old cookie stops working.
+    pub fn drop_user_sessions(&self, user_id: i64, keep: Option<&str>) {
+        let mut sessions = self.sessions.lock().expect("sessions mutex poisoned");
+        sessions.retain(|token, s| s.user_id != user_id || keep == Some(token.as_str()));
+    }
+
     /// Enforce the configured per-IP hourly registration limit.
     pub fn allow_registration(&self, ip: IpAddr) -> bool {
         let limit = self.settings().registrations_per_hour;

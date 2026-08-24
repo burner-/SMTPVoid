@@ -143,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mail/{id}/raw", get(mail_raw))
         .route("/mail/{id}/delete", post(mail_delete))
         .route("/mailbox/clear", post(mailbox_clear))
+        .route("/account/password", post(account_password))
         .route("/setup", get(setup_form).post(setup_submit))
         .route("/admin", get(admin_view))
         .route("/admin/users/{id}/delete", post(admin_delete_user))
@@ -436,6 +437,63 @@ async fn mailbox_clear(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     };
     state.mail.clear(user.id);
     redirect_ok("/dashboard", "Mailbox emptied")
+}
+
+#[derive(Deserialize)]
+struct PasswordForm {
+    current_password: String,
+    new_password: String,
+    confirm_password: String,
+}
+
+/// Change the signed-in user's web password. SMTP credentials are separate
+/// rows with their own passwords and are deliberately left alone.
+async fn account_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordForm>,
+) -> Response {
+    let user = match current_user(&state, &headers) {
+        Some(u) => u,
+        None => return Redirect::to("/login").into_response(),
+    };
+    if form.new_password != form.confirm_password {
+        return redirect_err("/dashboard", "The two new passwords do not match");
+    }
+    if form.new_password.len() < 8 || form.new_password.len() > 128 {
+        return redirect_err("/dashboard", "Password must be 8-128 characters");
+    }
+    if form.new_password == form.current_password {
+        return redirect_err("/dashboard", "The new password is the same as the old one");
+    }
+    // Two argon2 operations - verifying the old password and hashing the new
+    // one - so both go to the blocking pool, like every other hash here.
+    let stored = user.password_hash.clone();
+    let current = form.current_password;
+    let new = form.new_password;
+    let hashed = tokio::task::spawn_blocking(move || {
+        verify_password(&current, &stored).then(|| hash_password(&new))
+    })
+    .await;
+    let hashed = match hashed {
+        Ok(Some(Ok(h))) => h,
+        Ok(None) => return redirect_err("/dashboard", "Current password is not correct"),
+        _ => return redirect_err("/dashboard", "Internal error, please try again"),
+    };
+    match state.db.set_password(user.id, &hashed) {
+        Ok(true) => {
+            // Every other session was opened with the old password; end them,
+            // but keep this one so the change does not sign the user out.
+            state.drop_user_sessions(user.id, session_token(&headers).as_deref());
+            tracing::info!("password changed for user '{}' (id {})", user.username, user.id);
+            redirect_ok("/dashboard", "Password changed")
+        }
+        Ok(false) => redirect_err("/dashboard", "Account no longer exists"),
+        Err(e) => {
+            tracing::warn!("password change failed for user id {}: {e:#}", user.id);
+            redirect_err("/dashboard", "Could not change the password, please try again")
+        }
+    }
 }
 
 // ---- admin setup ----

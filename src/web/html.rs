@@ -314,6 +314,21 @@ pub fn dashboard_page(
         );
     }
     out.push_str("</div>");
+
+    // Account
+    out.push_str(
+        r#"<h2>Account</h2><div class="panel">
+<p class="muted small">Changing your sign-in password signs out every other browser. SMTP credentials are separate and keep working.</p>
+<form method="post" action="/account/password" style="max-width:420px">
+<label for="current_password">Current password</label>
+<input type="password" id="current_password" name="current_password" required maxlength="128" autocomplete="current-password">
+<label for="new_password">New password</label>
+<input type="password" id="new_password" name="new_password" required minlength="8" maxlength="128" autocomplete="new-password">
+<label for="confirm_password">New password again</label>
+<input type="password" id="confirm_password" name="confirm_password" required minlength="8" maxlength="128" autocomplete="new-password">
+<button class="primary">Change password</button>
+</form></div>"#,
+    );
     out
 }
 
