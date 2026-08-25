@@ -27,6 +27,10 @@ delivered or relayed**.
 - **Connection transparency** — every message records how it arrived: plaintext,
   STARTTLS, or implicit TLS, plus TLS version, cipher suite, client address,
   HELO/EHLO name and AUTH mechanism.
+- **Read-only mail API** — a token-authenticated `GET` API (`/api/list`,
+  `/api/latest`, `/api/get/<id>`) lets an end-to-end test assert on the mail its
+  application just sent. The token and its instructions sit on the dashboard,
+  behind the (i) next to it. See [Reading the mailbox from a test](#reading-the-mailbox-from-a-test).
 - **Ephemeral by design** — messages live only in RAM and vanish after the retention
   period (default 1 hour). Restarting the server empties all mailboxes.
 - **Configured from the browser** — hostname, listener addresses, retention, limits
@@ -281,6 +285,48 @@ cargo run --example smoke_client -- starttls localhost:587 <user> <pass>
 cargo run --example smoke_client -- tls      localhost:465 <user> <pass>
 ```
 
+## Reading the mailbox from a test
+
+Every account has a **mail API token**, shown on the dashboard next to the SMTP
+server details; the (i) button beside it opens the same instructions in the
+browser. Send the token in either header:
+
+```
+Authorization: Bearer svapi_xxxxxxxx
+X-API-Token: svapi_xxxxxxxx
+```
+
+| Request | Answer |
+| --- | --- |
+| `GET /api/list` | Summaries of every message in the mailbox, newest first: `count`, `total`, `messages`. |
+| `GET /api/latest` | The newest message, with its headers, bodies and raw source. |
+| `GET /api/get/<id>` | One message by the `id` a listing gave you, in the same shape. |
+| `GET /api` | The above as JSON. The only endpoint that needs no token. |
+
+`to`, `from` and `subject` are case-insensitive substring filters accepted by both
+`/api/list` and `/api/latest`, and `limit` caps a listing. They let a test wait for
+*its own* message instead of whatever arrived last:
+
+```bash
+# Wait up to 30 seconds for the message a test just triggered.
+for _ in $(seq 30); do
+  curl -sf -H "Authorization: Bearer $SMTPVOID_TOKEN"     "https://smtp.example.test/api/latest?to=alice@example.test" && break
+  sleep 1
+done
+```
+
+A single message carries the summary fields plus `text`, `html`, `attachments`,
+`headers` (name/value pairs, in arrival order) and `raw`. `text` and `html` are the
+parts that were actually in the message, so a mail sent as plain text reports
+`"html": null` rather than a conversion of its own text. `connection.security` is
+`plaintext`, `starttls` or `tls`, which is enough to assert that the client really
+did negotiate encryption.
+
+A missing or unknown token is `401`; a filter that matches nothing, or an id that has
+expired, is `404`. Both carry an `error` field. The API only reads — deleting mail
+stays in the web UI — and a token sees exactly one mailbox, its owner's. Regenerate
+it from the same dialog if it leaks; the old one stops working immediately.
+
 ## Security model & abuse resistance
 
 - **No outbound mail, ever.** There is no delivery queue, no relay logic, and no
@@ -297,6 +343,10 @@ cargo run --example smoke_client -- tls      localhost:465 <user> <pass>
   submit anything.
 - Session cookies are `HttpOnly` + `SameSite=Strict`; registration is rate-limited
   per IP; SMTP sessions disconnect after repeated authentication failures.
+- The mail API token is a server-generated random string that only reads its own
+  owner's mailbox, and the API exposes no way to modify anything. It is minted on
+  the first dashboard visit and can be replaced from the API dialog, which
+  invalidates the previous one at once.
 - Admins can list users and statistics and delete abusive accounts, but have no
   route to any message content. The settings and TLS pages are admin-only too.
 - The ACME challenge listener serves exactly one route and returns a token only

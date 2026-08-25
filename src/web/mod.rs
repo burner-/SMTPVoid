@@ -1,6 +1,7 @@
 //! Web management UI: registration, login, SMTP credential management,
 //! the virtual mailbox, admin statistics and first-run admin setup.
 
+mod api;
 mod html;
 mod tls_listener;
 
@@ -118,6 +119,24 @@ fn new_session(state: &AppState, user_id: i64) -> (String, String) {
     (token, cookie)
 }
 
+/// The account's REST API token, minted on first use. Every page that shows
+/// the token calls this, so an account created before the API existed gets one
+/// the next time its owner opens the dashboard.
+fn api_token_for(state: &AppState, user_id: i64) -> String {
+    let candidate = new_api_token();
+    match state.db.ensure_api_token(user_id, &candidate) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!("could not issue an API token for user {user_id}: {e:#}");
+            String::new()
+        }
+    }
+}
+
+fn new_api_token() -> String {
+    format!("svapi_{}", Alphanumeric.sample_string(&mut rand::thread_rng(), 40))
+}
+
 fn valid_username(s: &str) -> bool {
     (3..=32).contains(&s.len())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -143,6 +162,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mail/{id}/raw", get(mail_raw))
         .route("/mail/{id}/delete", post(mail_delete))
         .route("/mailbox/clear", post(mailbox_clear))
+        .route("/api-token/regenerate", post(api_token_regenerate))
         .route("/account", get(account_view))
         .route("/account/password", post(account_password))
         .route("/setup", get(setup_form).post(setup_submit))
@@ -152,6 +172,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/tls/renew", post(tls_renew))
         .route("/admin/tls/self-signed", post(tls_self_signed))
         .with_state(state.clone())
+        // The read-only mail API, authenticated by token rather than by cookie.
+        .merge(api::router(state.clone()))
         // Also answer ACME challenges here, for deployments that proxy
         // /.well-known/ to the web UI instead of exposing the port-80 listener.
         .merge(crate::acme::challenge_router(state))
@@ -305,6 +327,7 @@ async fn dashboard(
     let emails = state.mail.list(user.id);
     let (ok, err) = flash(&q);
     let settings = state.settings();
+    let api_token = api_token_for(&state, user.id);
     let body = html::dashboard_page(
         &user,
         &creds,
@@ -313,6 +336,7 @@ async fn dashboard(
         &settings.endpoint(&settings.smtps_addr),
         &settings.hostname,
         settings.retention_secs as i64,
+        &api_token,
     );
     Html(html::layout("Dashboard", html::Nav::User(&user), ok, err, &body)).into_response()
 }
@@ -352,6 +376,26 @@ async fn cred_delete(
     match state.db.delete_credential(user.id, id) {
         Ok(true) => redirect_ok("/dashboard", "SMTP credential deleted"),
         _ => redirect_err("/dashboard", "Credential not found"),
+    }
+}
+
+/// Issue a fresh API token, which immediately stops the previous one from
+/// working. Reached from the API help dialog on the dashboard.
+async fn api_token_regenerate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match current_user(&state, &headers) {
+        Some(u) => u,
+        None => return Redirect::to("/login").into_response(),
+    };
+    match state.db.set_api_token(user.id, &new_api_token()) {
+        Ok(true) => {
+            tracing::info!("user '{}' regenerated their API token", user.username);
+            redirect_ok("/dashboard", "New API token issued - the old one no longer works")
+        }
+        Ok(false) => redirect_err("/dashboard", "Account no longer exists"),
+        Err(e) => {
+            tracing::warn!("API token regeneration failed for user {}: {e:#}", user.id);
+            redirect_err("/dashboard", "Could not issue a new API token, please try again")
+        }
     }
 }
 

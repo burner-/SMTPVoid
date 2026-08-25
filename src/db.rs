@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS users (
     count_plaintext INTEGER NOT NULL DEFAULT 0,
     count_starttls INTEGER NOT NULL DEFAULT 0,
     count_tls INTEGER NOT NULL DEFAULT 0,
-    last_message_at INTEGER
+    last_message_at INTEGER,
+    api_token TEXT
 );
 -- An SMTP credential can only push mail into a virtual mailbox that is never
 -- delivered anywhere, so its password is kept in the clear and the dashboard
@@ -114,6 +115,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         migrate_credential_passwords(&conn)?;
+        migrate_api_tokens(&conn)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -239,6 +241,62 @@ impl Db {
         let conn = self.lock();
         conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ---- API tokens ----
+
+    /// The user's REST API token, minting `candidate` when the account does
+    /// not have one yet. The conditional UPDATE keeps two simultaneous
+    /// dashboard loads from handing out two different tokens.
+    pub fn ensure_api_token(&self, user_id: i64, candidate: &str) -> Result<String> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE users SET api_token = ?2 WHERE id = ?1 AND api_token IS NULL",
+            params![user_id, candidate],
+        )?;
+        let token: Option<String> = conn
+            .query_row(
+                "SELECT api_token FROM users WHERE id = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        token.ok_or_else(|| anyhow!("account no longer exists"))
+    }
+
+    /// Replace the API token, which immediately invalidates the old one.
+    pub fn set_api_token(&self, user_id: i64, token: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE users SET api_token = ?2 WHERE id = ?1",
+            params![user_id, token],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Resolve an API token to its owner. The column is unique and compared
+    /// with SQLite's default binary collation, so this is case-sensitive.
+    pub fn get_user_by_api_token(&self, token: &str) -> Result<Option<User>> {
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let user = conn
+            .query_row(
+                "SELECT id, username, password_hash, is_admin FROM users WHERE api_token = ?1",
+                params![token],
+                |r| {
+                    Ok(User {
+                        id: r.get(0)?,
+                        username: r.get(1)?,
+                        password_hash: r.get(2)?,
+                        is_admin: r.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(user)
     }
 
     // ---- SMTP credentials ----
@@ -434,5 +492,23 @@ fn migrate_credential_passwords(conn: &Connection) -> Result<()> {
             "removed {dropped} SMTP credential(s) that only had a hashed password; their owners create new ones from the dashboard"
         );
     }
+    Ok(())
+}
+
+/// The REST API arrived after the first databases were created, so an existing
+/// `users` table gains the column here. The unique index guards against two
+/// accounts ever sharing a token; SQLite allows any number of NULLs in it, and
+/// NULL is exactly what an account that has not opened its dashboard yet has.
+fn migrate_api_tokens(conn: &Connection) -> Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'api_token'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute("ALTER TABLE users ADD COLUMN api_token TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_token ON users(api_token)",
+        [],
+    )?;
     Ok(())
 }

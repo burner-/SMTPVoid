@@ -25,6 +25,16 @@ impl ConnKind {
             ConnKind::ImplicitTls => "implicit TLS",
         }
     }
+
+    /// The same thing in a form a test can compare against: lowercase, stable,
+    /// and never containing a space. Used by the REST API.
+    pub fn api_name(self) -> &'static str {
+        match self {
+            ConnKind::Plaintext => "plaintext",
+            ConnKind::StartTls => "starttls",
+            ConnKind::ImplicitTls => "tls",
+        }
+    }
 }
 
 /// Connection metadata recorded for every accepted message.

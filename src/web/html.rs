@@ -109,6 +109,26 @@ textarea { resize:vertical; min-height:64px; }
 .copy.failed { border-color:#6b5518; background:#3a2d12; color:var(--amber); font-size:11px; padding:4px 6px; }
 footer { max-width:1100px; margin:0 auto; padding:20px; color:var(--muted); font-size:13px;
          border-top:1px solid var(--border); }
+.info { display:inline-flex; align-items:center; justify-content:center; margin:0 0 0 4px; padding:3px;
+  border-color:transparent; background:transparent; color:var(--muted); vertical-align:middle; }
+.info svg { width:16px; height:16px; display:block; }
+.info:hover { background:transparent; color:var(--accent); }
+dialog.modal { padding:0; width:min(760px, calc(100% - 32px)); max-height:86vh; overflow:auto;
+  background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:10px; }
+dialog.modal::backdrop { background:rgba(1,4,9,.72); }
+.mhead { display:flex; align-items:center; gap:12px; padding:14px 22px;
+  border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--panel); }
+.mhead h2 { margin:0; font-size:17px; }
+.mhead button { margin:0 0 0 auto; padding:5px 12px; }
+.mbody { padding:6px 22px 22px; }
+.mbody h3 { font-size:14px; margin:22px 0 6px; }
+.mbody p { font-size:14px; }
+.mbody table { margin:6px 0; }
+.mbody table td code { white-space:nowrap; }
+.copyblock { position:relative; }
+.copyblock pre { margin:8px 0; padding-right:46px; }
+.copyblock .copy { position:absolute; top:16px; right:8px; margin:0; padding:5px;
+  background:#21262d; border:1px solid var(--border); }
 "#;
 
 /// Clipboard support for every `.copy` button on the page. The modern API only
@@ -164,6 +184,44 @@ document.addEventListener('click', function (e) {
 });
 "#;
 
+/// Opening and closing for every `<dialog class="modal">` on the page, plus the
+/// substitution of `__BASE__` in the API examples: the documented base URL is
+/// whatever origin the reader reached this page on, which the server cannot
+/// know behind a proxy but the browser always does.
+const MODAL_JS: &str = r#"
+document.addEventListener('click', function (e) {
+  if (!e.target || !e.target.closest) return;
+  var opener = e.target.closest('[data-modal]');
+  if (opener) {
+    var dlg = document.getElementById(opener.getAttribute('data-modal'));
+    if (dlg && dlg.showModal) { e.preventDefault(); dlg.showModal(); }
+    return;
+  }
+  var closer = e.target.closest('[data-close]');
+  if (closer) {
+    var owner = closer.closest('dialog');
+    if (owner) { e.preventDefault(); owner.close(); }
+    return;
+  }
+  // A click that lands on the dialog element itself came from the backdrop:
+  // the content all sits in child elements.
+  if (e.target.tagName === 'DIALOG' && e.target.close) e.target.close();
+});
+(function () {
+  var base = window.location.origin;
+  var nodes = document.querySelectorAll('dialog.modal code, dialog.modal pre, dialog.modal button.copy');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var copy = el.getAttribute('data-copy');
+    if (copy !== null) {
+      el.setAttribute('data-copy', copy.split('__BASE__').join(base));
+    } else if (!el.firstElementChild) {
+      el.textContent = el.textContent.split('__BASE__').join(base);
+    }
+  }
+})();
+"#;
+
 /// Navigation context for the layout.
 pub enum Nav<'a> {
     Anonymous,
@@ -206,7 +264,7 @@ pub fn layout(title: &str, nav: Nav, flash_ok: Option<&str>, flash_err: Option<&
 <header><div class="hwrap"><a class="logo" href="/">SMTP<span>Void</span></a>{nav_html}</div></header>
 <main>{flash}{body}</main>
 <footer>SMTPVoid is an SMTP testing sink. Messages are held in memory for a limited time and are <strong>never delivered anywhere</strong>.</footer>
-<script>{COPY_JS}</script>
+<script>{COPY_JS}{MODAL_JS}</script>
 </body>
 </html>"#,
         title = esc(title),
@@ -226,6 +284,17 @@ pub fn copyable(value: &str) -> String {
 /// the button's colour through `currentColor`, so the hover and success states
 /// need no second copy of it.
 const COPY_ICON: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>"#;
+
+/// A circled "i", drawn in the same line style as the copy glyph above.
+const INFO_ICON: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.6h.01"/></svg>"#;
+
+/// A multi-line snippet with a copy button parked in its top-right corner.
+fn copy_block(value: &str) -> String {
+    format!(
+        r#"<div class="copyblock"><pre><code>{v}</code></pre><button type="button" class="copy" data-copy="{v}" title="Copy to clipboard" aria-label="Copy to clipboard">{COPY_ICON}</button></div>"#,
+        v = esc(value)
+    )
+}
 
 pub fn badge(kind: ConnKind) -> &'static str {
     match kind {
@@ -290,6 +359,7 @@ pub fn dashboard_page(
     smtps_endpoint: &str,
     hostname: &str,
     retention_secs: i64,
+    api_token: &str,
 ) -> String {
     let now = now_unix();
     let mut out = String::new();
@@ -309,10 +379,12 @@ pub fn dashboard_page(
 <dt>Server (implicit TLS)</dt><dd>{smtps}</dd>
 <dt>Hostname</dt><dd>{host}</dd>
 <dt>Mechanisms</dt><dd><code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></dd>
+<dt>Mail API token</dt><dd>{token}</dd>
 </div>"#,
         smtp = copyable(smtp_endpoint),
         smtps = copyable(smtps_endpoint),
         host = copyable(hostname),
+        token = api_token_field(api_token),
     ));
     if creds.is_empty() {
         out.push_str(r#"<p class="muted" style="margin-bottom:0">No SMTP credentials yet. Create one to start sending mail into the void.</p>"#);
@@ -373,8 +445,115 @@ pub fn dashboard_page(
     }
     out.push_str("</div>");
 
+    out.push_str(&api_doc_modal(api_token));
     out
 }
+
+/// The token itself plus the button that opens the API instructions.
+fn api_token_field(api_token: &str) -> String {
+    let value = if api_token.is_empty() {
+        r#"<span class="muted">unavailable - reload the page</span>"#.to_string()
+    } else {
+        copyable(api_token)
+    };
+    format!(
+        r#"{value}<button type="button" class="info" data-modal="apidoc" title="How to read your mailbox over REST" aria-label="How to read your mailbox over REST">{INFO_ICON}</button>"#
+    )
+}
+
+/// Instructions for the mail API, shown in a dialog behind the (i) button on
+/// the dashboard. The examples carry the reader's own token; the base URL is
+/// filled in by [`MODAL_JS`] from the address the page was loaded from, since
+/// the server behind a proxy cannot know which one that was.
+fn api_doc_modal(api_token: &str) -> String {
+    let token = if api_token.is_empty() { "YOUR_API_TOKEN" } else { api_token };
+    let filtered = copy_block(&format!(
+        r#"curl -s -H "Authorization: Bearer {token}" \
+  "__BASE__/api/latest?to=alice@example.test&subject=welcome""#
+    ));
+    let poll = copy_block(&format!(
+        r#"# Wait up to 30 seconds for the message a test just triggered.
+for _ in $(seq 30); do
+  curl -sf -H "Authorization: Bearer {token}" \
+    "__BASE__/api/latest?to=alice@example.test" && break
+  sleep 1
+done"#
+    ));
+
+    DOC.replace("__CURL_FILTERED__", &filtered)
+        .replace("__CURL_POLL__", &poll)
+        .replace("__TOKEN__", &esc(token))
+}
+
+const DOC: &str = r#"<dialog class="modal" id="apidoc" aria-label="Mail REST API">
+<div class="mhead"><h2>Mail REST API</h2><button type="button" data-close>Close</button></div>
+<div class="mbody">
+<p>Read this mailbox over HTTP, so an end-to-end test can assert on the mail your application just sent. Every endpoint is a <code>GET</code> that answers JSON. The API only reads: deleting mail stays in this web UI.</p>
+
+<h3>Authentication</h3>
+<p>Send the token from the dashboard in either header. It identifies your account, so treat it like a password.</p>
+<pre><code>Authorization: Bearer __TOKEN__
+X-API-Token: __TOKEN__</code></pre>
+
+<h3>Endpoints</h3>
+<table>
+<tr><th>Request</th><th>Answer</th></tr>
+<tr><td><code>GET /api/list</code></td><td>Summaries of every message, newest first: <code>count</code>, <code>total</code> and <code>messages</code>.</td></tr>
+<tr><td><code>GET /api/latest</code></td><td>The newest message, with its headers, bodies and raw source.</td></tr>
+<tr><td><code>GET /api/get/&lt;id&gt;</code></td><td>One message by the <code>id</code> a listing gave you, in the same shape.</td></tr>
+<tr><td><code>GET /api</code></td><td>This summary as JSON. The only endpoint that needs no token.</td></tr>
+</table>
+
+<h3>Filters</h3>
+<p><code>to</code>, <code>from</code> and <code>subject</code> are case-insensitive substring matches, accepted by both <code>/api/list</code> and <code>/api/latest</code>; <code>limit</code> caps a listing. They let a test wait for <em>its own</em> message rather than whatever arrived last.</p>
+__CURL_FILTERED__
+
+<h3>Waiting for a message</h3>
+<p>Mail is captured the moment the SMTP transaction ends, so a short poll is all it takes. <code>-f</code> makes curl fail on the 404 that means &ldquo;nothing matches yet&rdquo;.</p>
+__CURL_POLL__
+
+<h3>What a message looks like</h3>
+<pre><code>{
+  "id": "hT4mQ2v9XcR7bN1sKp0LdW8y",
+  "subject": "Welcome aboard",
+  "from": "App <no-reply@example.test>",
+  "mail_from": "no-reply@example.test",
+  "rcpt_to": ["alice@example.test"],
+  "size": 412,
+  "received_at": 1750000000,
+  "expires_at": 1750003600,
+  "credential": "sv_ab12cd34ef",
+  "connection": {
+    "security": "starttls",
+    "tls_version": "TLSv1.3",
+    "tls_cipher": "TLS13_AES_256_GCM_SHA384",
+    "peer": "203.0.113.7:51544",
+    "helo": "app.example.test",
+    "esmtp": true,
+    "auth": "PLAIN"
+  },
+  "parsed": true,
+  "text": "Hello Alice,\n",
+  "html": null,
+  "attachments": [],
+  "headers": [{ "name": "Subject", "value": "Welcome aboard" }],
+  "raw": "Subject: Welcome aboard\r\n..."
+}</code></pre>
+<p class="muted small"><code>security</code> is one of <code>plaintext</code>, <code>starttls</code> or <code>tls</code>, so a test can assert that its client really did negotiate encryption. A listing entry stops at <code>connection</code>; the fields after it come with a single message.</p>
+
+<h3>Status codes</h3>
+<table>
+<tr><td><code>200</code></td><td>Here it is.</td></tr>
+<tr><td><code>401</code></td><td>The token was missing or unknown.</td></tr>
+<tr><td><code>404</code></td><td>No message matches, or that id has expired. Messages vanish when the retention window closes.</td></tr>
+</table>
+<p class="muted small">Errors carry an <code>error</code> field explaining themselves.</p>
+
+<h3>Your token</h3>
+<p class="muted small">Anyone holding this token can read every message in your mailbox. If it leaks, issue a new one - the old one stops working immediately.</p>
+<form method="post" action="/api-token/regenerate" onsubmit="return confirm('Issue a new API token? Anything still using the current one stops working.')"><button class="danger">Regenerate token</button></form>
+</div>
+</dialog>"#;
 
 /// The signed-in user's own profile, reached by clicking the username in the
 /// header. Sign-in details only; SMTP credentials stay on the dashboard.
