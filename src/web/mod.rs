@@ -183,12 +183,7 @@ pub async fn serve_https(state: Arc<AppState>, listener: TcpListener) -> Result<
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let settings = state.settings();
-    let body = html::index_page(
-        &settings.endpoint(&settings.smtp_addr),
-        &settings.endpoint(&settings.smtps_addr),
-        settings.retention_secs as i64,
-        settings.registration_open,
-    );
+    let body = html::index_page(settings.retention_secs as i64, settings.registration_open);
     let nav = match current_user(&state, &headers) {
         Some(u) => html::layout("SMTP testing sink", html::Nav::User(&u), None, None, &body),
         None => html::layout("SMTP testing sink", html::Nav::Anonymous, None, None, &body),

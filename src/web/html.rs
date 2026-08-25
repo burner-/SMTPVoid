@@ -222,12 +222,9 @@ pub fn badge(kind: ConnKind) -> &'static str {
     }
 }
 
-pub fn index_page(
-    smtp_endpoint: &str,
-    smtps_endpoint: &str,
-    retention_secs: i64,
-    registration_open: bool,
-) -> String {
+/// The public front page. The server addresses and the connection details
+/// belong to the signed-in dashboard, not here.
+pub fn index_page(retention_secs: i64, registration_open: bool) -> String {
     let actions = if registration_open {
         r#"<p><a class="btn" href="/register">Create an account</a> <a class="btn" href="/login">Sign in</a></p>"#.to_string()
     } else {
@@ -244,22 +241,11 @@ pub fn index_page(
 <li>Create a free account and generate SMTP credentials.</li>
 <li>Configure your application to send mail through this server using those credentials.</li>
 <li>Messages to any recipient are captured into your private virtual mailbox.</li>
-<li>Each message shows how it arrived: <span class="badge b-plain">plaintext</span> <span class="badge b-starttls">STARTTLS</span> or <span class="badge b-tls">implicit TLS</span>, including TLS version and cipher.</li>
 <li>Messages self-destruct after {retention}. Nothing is ever stored on disk or delivered to a real mailbox &mdash; this service cannot be used to send actual email.</li>
 </ol>
 </div>
-<div class="panel">
-<h2 style="margin-top:0">Endpoints</h2>
-<div class="kv">
-<dt>SMTP (plaintext + STARTTLS)</dt><dd><code>{smtp}</code></dd>
-<dt>SMTPS (implicit TLS)</dt><dd><code>{smtps}</code></dd>
-<dt>Authentication</dt><dd><code>AUTH PLAIN</code> and <code>AUTH LOGIN</code></dd>
-</div>
-</div>
 {actions}"#,
         retention = fmt_duration(retention_secs),
-        smtp = esc(smtp_endpoint),
-        smtps = esc(smtps_endpoint),
     )
 }
 
