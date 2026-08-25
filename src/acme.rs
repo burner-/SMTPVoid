@@ -459,9 +459,14 @@ async fn obtain(state: &Arc<AppState>, settings: &Settings) -> Result<()> {
         .await
         .context("downloading the certificate")?;
 
+    let source = if settings.acme_directory == LETSENCRYPT_STAGING {
+        CertSource::AcmeStaging
+    } else {
+        CertSource::Acme
+    };
     state
         .certs
-        .install_pem(&cert_pem, &key_pem)
+        .install_known_pem(&cert_pem, &key_pem, source)
         .context("installing the issued certificate")?;
     tracing::info!("ACME certificate for [{}] is now live", domains.join(", "));
     Ok(())

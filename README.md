@@ -145,6 +145,13 @@ SMTPS and the HTTPS UI pick it up on their next connection, with no restart and
 no dropped sessions. The settings page shows the current certificate, its expiry
 and the result of the last order.
 
+A certificate this server ordered is recorded in `data/tls/issued-by.json`
+(source plus serial number), so recognising it later is a lookup rather than a
+guess at the issuer's name — Let's Encrypt issues from intermediates called
+things like `E5`, `R11` and `YE2`, and a certificate mistaken for someone else's
+is a certificate the renewal check replaces every time it runs. For material the
+operator installed, the issuer's organisation is what decides.
+
 Renewal is checked every six hours (sooner after a failure, backing off from 15
 minutes towards six hours) and runs when the certificate is missing, does not
 cover every configured domain, came from a different ACME environment than the

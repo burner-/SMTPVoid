@@ -15,6 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
+use serde::{Deserialize, Serialize};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// Where the certificate came from, for display in the admin UI.
@@ -39,6 +40,46 @@ impl CertSource {
             CertSource::External => "external",
         }
     }
+}
+
+impl CertSource {
+    /// Stable name for the on-disk record, kept apart from [`Self::label`],
+    /// which is prose and may be reworded.
+    fn key(self) -> &'static str {
+        match self {
+            CertSource::SelfSigned => "self-signed",
+            CertSource::Acme => "acme",
+            CertSource::AcmeStaging => "acme-staging",
+            CertSource::External => "external",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<CertSource> {
+        match key {
+            "self-signed" => Some(CertSource::SelfSigned),
+            "acme" => Some(CertSource::Acme),
+            "acme-staging" => Some(CertSource::AcmeStaging),
+            "external" => Some(CertSource::External),
+            _ => None,
+        }
+    }
+}
+
+/// Where the certificate on disk came from, recorded when this server
+/// installed one it ordered itself. The serial ties the record to that exact
+/// certificate, so a hand-replaced file is not mistaken for it.
+#[derive(Serialize, Deserialize)]
+struct Provenance {
+    source: String,
+    serial: String,
+}
+
+/// The leaf certificate's serial number, as hex.
+fn serial_of(certs: &[CertificateDer<'static>]) -> Result<String> {
+    let leaf = certs.first().ok_or_else(|| anyhow!("empty certificate chain"))?;
+    let (_, parsed) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|e| anyhow!("cannot parse certificate: {e}"))?;
+    Ok(parsed.raw_serial_as_string())
 }
 
 /// What the admin UI shows about the certificate currently in use.
@@ -138,13 +179,42 @@ impl CertStore {
         self.install_pem(&cert.pem(), &key.serialize_pem())
     }
 
+    /// Install a certificate whose origin is known - one this server just
+    /// ordered. The origin is recorded next to it, so recognising it later is a
+    /// lookup rather than a guess at the issuer's name.
+    pub fn install_known_pem(
+        &self,
+        cert_pem: &str,
+        key_pem: &str,
+        source: CertSource,
+    ) -> Result<()> {
+        self.write_pem(cert_pem, key_pem, Some(source))
+    }
+
+    /// Install a certificate of unknown origin: the operator's own, or a
+    /// self-signed placeholder. Its source is whatever the issuer looks like.
+    pub fn install_pem(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
+        self.write_pem(cert_pem, key_pem, None)
+    }
+
     /// Write a PEM certificate chain and key to disk, then make them current.
     /// The new material is validated before either file is replaced, so a bad
     /// ACME response cannot leave the server without a usable certificate.
-    pub fn install_pem(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
+    fn write_pem(&self, cert_pem: &str, key_pem: &str, source: Option<CertSource>) -> Result<()> {
         let (certs, key) = parse_pem(cert_pem, key_pem)?;
         let certified = build_certified_key(certs.clone(), key)?;
-        let info = inspect(&certs)?;
+        let mut info = inspect(&certs)?;
+        match source {
+            Some(source) => {
+                info.source = source;
+                self.write_provenance(&Provenance {
+                    source: source.key().to_string(),
+                    serial: serial_of(&certs)?,
+                });
+            }
+            // A replacement of unknown origin invalidates what was recorded.
+            None => self.forget_provenance(),
+        }
 
         // Key first: a chain without its key is useless, a key without its
         // chain is harmless, so this ordering survives a crash between writes.
@@ -170,8 +240,43 @@ impl CertStore {
             .with_context(|| format!("reading {}", self.key_path().display()))?;
         let (certs, key) = parse_pem(&cert_pem, &key_pem)?;
         let certified = build_certified_key(certs.clone(), key)?;
-        self.set(certified, inspect(&certs)?);
+        let mut info = inspect(&certs)?;
+        // A certificate this server ordered says so in the record beside it.
+        // The issuer heuristic below is for everything else, and it is only a
+        // heuristic: Let's Encrypt has issued from a "YE2" intermediate, which
+        // spells out nothing at all.
+        if let Some(recorded) = self.provenance() {
+            if serial_of(&certs).is_ok_and(|s| s == recorded.serial) {
+                if let Some(source) = CertSource::from_key(&recorded.source) {
+                    info.source = source;
+                }
+            }
+        }
+        self.set(certified, info);
         Ok(())
+    }
+
+    fn provenance_path(&self) -> PathBuf {
+        self.dir.join("issued-by.json")
+    }
+
+    fn provenance(&self) -> Option<Provenance> {
+        let raw = fs::read_to_string(self.provenance_path()).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn write_provenance(&self, p: &Provenance) {
+        let written = serde_json::to_string_pretty(p)
+            .map_err(std::io::Error::other)
+            .and_then(|json| fs::write(self.provenance_path(), json));
+        if let Err(e) = written {
+            // Only costs the next load its certainty about the source.
+            tracing::warn!("could not record the certificate origin: {e}");
+        }
+    }
+
+    fn forget_provenance(&self) {
+        let _ = fs::remove_file(self.provenance_path());
     }
 
     /// Load the certificate from disk, generating a self-signed one if there
@@ -256,30 +361,29 @@ fn inspect(certs: &[CertificateDer<'static>]) -> Result<CertInfo> {
         names.extend(parsed.subject().iter_common_name().filter_map(|cn| cn.as_str().ok()).map(str::to_string));
     }
 
-    let issuer = parsed
+    let cn = parsed
         .issuer()
         .iter_common_name()
-        .find_map(|cn| cn.as_str().ok())
-        .unwrap_or("(unknown issuer)")
+        .find_map(|v| v.as_str().ok())
+        .unwrap_or("")
         .to_string();
+    let org = parsed
+        .issuer()
+        .iter_organization()
+        .find_map(|v| v.as_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let issuer = match (org.as_str(), cn.as_str()) {
+        ("", "") => "(unknown issuer)".to_string(),
+        ("", cn) => cn.to_string(),
+        (org, "") => org.to_string(),
+        (org, cn) => format!("{org} {cn}"),
+    };
 
-    let self_signed = parsed.subject() == parsed.issuer();
-    let staging = issuer.contains("(STAGING)")
-        || issuer.contains("Pretend Pear")
-        || issuer.contains("Fake LE")
-        || issuer.contains("False Fennel")
-        || issuer.contains("Wannabe Watercress");
-    let source = if self_signed {
+    let source = if parsed.subject() == parsed.issuer() {
         CertSource::SelfSigned
-    } else if staging {
-        CertSource::AcmeStaging
-    } else if issuer.contains("Let's Encrypt")
-        || issuer.starts_with('E') && issuer.len() <= 3
-        || issuer.starts_with('R') && issuer.len() <= 3
-    {
-        CertSource::Acme
     } else {
-        CertSource::External
+        classify_issuer(&cn, &org)
     };
 
     Ok(CertInfo {
@@ -289,6 +393,30 @@ fn inspect(certs: &[CertificateDer<'static>]) -> Result<CertInfo> {
         not_before: parsed.validity().not_before.timestamp(),
         not_after: parsed.validity().not_after.timestamp(),
     })
+}
+
+/// Guess where a certificate came from by its issuer, for certificates this
+/// server did not install itself (see [`CertStore::install_known_pem`], whose
+/// record beats this). The organisation is what carries the meaning: Let's
+/// Encrypt names its intermediates things like `E5`, `R11` and `YE2`, and a
+/// common name alone tells nobody anything.
+fn classify_issuer(cn: &str, org: &str) -> CertSource {
+    let staging = ["(STAGING)", "Pretend Pear", "Fake LE", "False Fennel", "Wannabe Watercress"]
+        .iter()
+        .any(|marker| cn.contains(marker) || org.contains(marker));
+    if staging {
+        return CertSource::AcmeStaging;
+    }
+    // A short code of one or two letters and a number is the shape Let's
+    // Encrypt uses; keep it for certificates whose organisation is missing.
+    let short_code = (2..=4).contains(&cn.len())
+        && cn.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && cn.chars().any(|c| c.is_ascii_digit())
+        && cn.chars().all(|c| c.is_ascii_alphanumeric());
+    if org.contains("Let's Encrypt") || cn.contains("Let's Encrypt") || short_code {
+        return CertSource::Acme;
+    }
+    CertSource::External
 }
 
 /// Write a secret with owner-only permissions where the platform supports it.
@@ -335,6 +463,46 @@ mod tests {
         assert_eq!(reopened.info().expect("info").names, info.names);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issuers_are_classified_by_organisation_not_just_common_name() {
+        // The one that started this: a real Let's Encrypt certificate whose
+        // common name says nothing, which used to read as "external" and so
+        // never satisfied the renewal check - one order every six hours.
+        assert_eq!(classify_issuer("YE2", "Let's Encrypt"), CertSource::Acme);
+        assert_eq!(classify_issuer("E5", "Let's Encrypt"), CertSource::Acme);
+        assert_eq!(classify_issuer("R11", ""), CertSource::Acme);
+        assert_eq!(
+            classify_issuer("(STAGING) False Fennel E1", "(STAGING) Let's Encrypt"),
+            CertSource::AcmeStaging
+        );
+        assert_eq!(classify_issuer("Acme Corp Issuing CA", "Acme Corp"), CertSource::External);
+        assert_eq!(classify_issuer("", ""), CertSource::External);
+    }
+
+    #[test]
+    fn a_recorded_origin_survives_a_reload() {
+        let dir = std::env::temp_dir().join(format!("smtpvoid-prov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CertStore::new(&dir).expect("store");
+        store.generate_self_signed(&["mail.example.test".to_string()]).expect("self-signed");
+        let cert = std::fs::read_to_string(dir.join("tls/cert.pem")).expect("cert");
+        let key = std::fs::read_to_string(dir.join("tls/key.pem")).expect("key");
+
+        // Claim it came from an order: a reload must believe the record rather
+        // than the certificate's own (self-signed) issuer.
+        store.install_known_pem(&cert, &key, CertSource::Acme).expect("install");
+        assert_eq!(store.info().expect("info").source, CertSource::Acme);
+        store.load_from_disk().expect("reload");
+        assert_eq!(store.info().expect("info").source, CertSource::Acme);
+
+        // Replacing it with material of unknown origin drops the record.
+        store.install_pem(&cert, &key).expect("reinstall");
+        store.load_from_disk().expect("reload");
+        assert_eq!(store.info().expect("info").source, CertSource::SelfSigned);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
