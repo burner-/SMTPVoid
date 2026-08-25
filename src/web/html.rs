@@ -101,9 +101,12 @@ textarea { resize:vertical; min-height:64px; }
 .stack { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .stack form { margin:0; }
 .copyable { display:inline-flex; align-items:center; gap:6px; }
-.copy { margin:0; padding:2px 8px; font-size:12px; line-height:1.4; color:var(--muted); }
+.copy { display:inline-flex; align-items:center; justify-content:center; margin:0; padding:4px;
+  font-size:12px; line-height:1; color:var(--muted); }
+.copy svg { width:14px; height:14px; display:block; }
 .copy:hover { color:var(--text); }
 .copy.done { border-color:#1f6b34; background:#12351c; color:var(--green); }
+.copy.failed { border-color:#6b5518; background:#3a2d12; color:var(--amber); font-size:11px; padding:4px 6px; }
 footer { max-width:1100px; margin:0 auto; padding:20px; color:var(--muted); font-size:13px;
          border-top:1px solid var(--border); }
 "#;
@@ -112,16 +115,21 @@ footer { max-width:1100px; margin:0 auto; padding:20px; color:var(--muted); font
 /// exists in a secure context, and this UI is often served over plain HTTP, so
 /// the old hidden-textarea trick stays as the fallback.
 const COPY_JS: &str = r#"
+var CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
 document.addEventListener('click', function (e) {
   var btn = e.target && e.target.closest && e.target.closest('button.copy');
   if (!btn) return;
   e.preventDefault();
   var text = btn.getAttribute('data-copy') || '';
   function done(ok) {
-    var label = btn.textContent;
-    btn.textContent = ok ? 'Copied' : 'Press Ctrl+C';
-    if (ok) btn.classList.add('done');
-    setTimeout(function () { btn.textContent = label; btn.classList.remove('done'); }, 1200);
+    var glyph = btn.innerHTML;
+    btn.innerHTML = ok ? CHECK_ICON : 'Ctrl+C';
+    btn.classList.add(ok ? 'done' : 'failed');
+    setTimeout(function () {
+      btn.innerHTML = glyph;
+      btn.classList.remove('done');
+      btn.classList.remove('failed');
+    }, 1200);
   }
   function fallback() {
     var ta = document.createElement('textarea');
@@ -209,10 +217,15 @@ pub fn layout(title: &str, nav: Nav, flash_ok: Option<&str>, flash_err: Option<&
 /// that puts it on the clipboard. The script behind it lives in [`layout`].
 pub fn copyable(value: &str) -> String {
     format!(
-        r#"<span class="copyable"><code>{v}</code><button type="button" class="copy" data-copy="{v}" title="Copy to clipboard" aria-label="Copy to clipboard">Copy</button></span>"#,
+        r#"<span class="copyable"><code>{v}</code><button type="button" class="copy" data-copy="{v}" title="Copy to clipboard" aria-label="Copy to clipboard">{COPY_ICON}</button></span>"#,
         v = esc(value)
     )
 }
+
+/// The usual clipboard glyph: a sheet sitting on top of another one. Inherits
+/// the button's colour through `currentColor`, so the hover and success states
+/// need no second copy of it.
+const COPY_ICON: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>"#;
 
 pub fn badge(kind: ConnKind) -> &'static str {
     match kind {
@@ -292,14 +305,14 @@ pub fn dashboard_page(
     out.push_str(&format!(
         r#"<h2>SMTP credentials</h2><div class="panel">
 <div class="kv">
-<dt>Server (plaintext/STARTTLS)</dt><dd><code>{smtp}</code></dd>
-<dt>Server (implicit TLS)</dt><dd><code>{smtps}</code></dd>
-<dt>Hostname</dt><dd><code>{host}</code></dd>
+<dt>Server (plaintext/STARTTLS)</dt><dd>{smtp}</dd>
+<dt>Server (implicit TLS)</dt><dd>{smtps}</dd>
+<dt>Hostname</dt><dd>{host}</dd>
 <dt>Mechanisms</dt><dd><code>AUTH PLAIN</code>, <code>AUTH LOGIN</code></dd>
 </div>"#,
-        smtp = esc(smtp_endpoint),
-        smtps = esc(smtps_endpoint),
-        host = esc(hostname),
+        smtp = copyable(smtp_endpoint),
+        smtps = copyable(smtps_endpoint),
+        host = copyable(hostname),
     ));
     if creds.is_empty() {
         out.push_str(r#"<p class="muted" style="margin-bottom:0">No SMTP credentials yet. Create one to start sending mail into the void.</p>"#);
