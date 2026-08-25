@@ -184,16 +184,21 @@ sudo ./install-ubuntu.sh --pull
 
 Every run rebuilds, reinstalls the binary and the unit, and restarts the
 service, whether or not anything changed — the data directory (database, TLS
-material, ACME state) is never touched.
+material, ACME state) is never touched. The closing summary says which parts
+were actually updated, when the service restarted and which revision it was
+built from, and it warns if the running process is not the binary that was just
+installed.
+
+An upgrade run also keeps the layout it finds: the service user, the web bind
+address and the data directory are read back from the installed unit unless the
+command line names them again. A bare `--pull` therefore cannot move the service
+to a different data directory, which would look like a fresh install to the
+server — self-signed certificate, new ACME order and new setup token included.
 
 > **Upgrading past the plaintext-credential change:** SMTP credentials created
 > while passwords were hashed cannot be recovered, so the first start after that
 > change deletes them and logs how many went. Accounts, settings and statistics
 > are untouched; users create new credentials from the dashboard.
- The closing summary says which parts
-were actually updated, when the service restarted and which revision it was
-built from, and it warns if the running process is not the binary that was just
-installed.
 
 `--data-dir`, `--http-addr`, `--user`, `--prefix`, `--binary` (skip the build),
 `--acme-staging`, `--open-firewall` and `--no-start` are available too; see

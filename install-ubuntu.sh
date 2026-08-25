@@ -22,6 +22,13 @@ ORIGINAL_ARGS=("$@")
 SERVICE_USER=smtpvoid
 DATA_DIR=/var/lib/smtpvoid
 HTTP_ADDR=0.0.0.0:8080
+# Whether those three came from the command line. An upgrade run is usually
+# just "--pull", and silently resetting them to the defaults would point the
+# service at a different data directory - an empty one, so it would generate a
+# self-signed certificate and order a new Let's Encrypt one for nothing.
+USER_SET=0
+DATA_DIR_SET=0
+HTTP_ADDR_SET=0
 BIN_DIR=/usr/local/bin
 UNIT_DIR=/etc/systemd/system
 PREBUILT_BINARY=
@@ -91,9 +98,9 @@ while [ $# -gt 0 ]; do
         --email)          ACME_EMAIL=${2:?--email needs a value}; shift 2 ;;
         --acme-staging)   ACME_STAGING=1; shift ;;
         --https)          HTTPS_ADDR=0.0.0.0:443; shift ;;
-        --user)           SERVICE_USER=${2:?--user needs a value}; shift 2 ;;
-        --data-dir)       DATA_DIR=${2:?--data-dir needs a value}; shift 2 ;;
-        --http-addr)      HTTP_ADDR=${2:?--http-addr needs a value}; shift 2 ;;
+        --user)           SERVICE_USER=${2:?--user needs a value}; USER_SET=1; shift 2 ;;
+        --data-dir)       DATA_DIR=${2:?--data-dir needs a value}; DATA_DIR_SET=1; shift 2 ;;
+        --http-addr)      HTTP_ADDR=${2:?--http-addr needs a value}; HTTP_ADDR_SET=1; shift 2 ;;
         --prefix)         BIN_DIR=${2:?--prefix needs a value}; shift 2 ;;
         --binary)         PREBUILT_BINARY=${2:?--binary needs a value}; shift 2 ;;
         --pull)           PULL=1; shift ;;
@@ -289,6 +296,31 @@ else
 fi
 
 UNIT_FILE=$UNIT_DIR/smtpvoid.service
+
+# An installed unit is the record of how this host was set up, so keep whatever
+# it says for anything this run did not mention. Otherwise a bare "--pull"
+# would move the service to the default user, port and data directory - and a
+# different data directory looks like a fresh install to the server:
+# self-signed certificate, new ACME order, new setup token.
+unit_value() {
+    sed -n "s|^$1||p" "$UNIT_FILE" 2>/dev/null | tail -n1
+}
+if [ -f "$UNIT_FILE" ]; then
+    if [ "$USER_SET" -eq 0 ]; then
+        INSTALLED=$(unit_value 'User=')
+        [ -z "$INSTALLED" ] || SERVICE_USER=$INSTALLED
+    fi
+    if [ "$DATA_DIR_SET" -eq 0 ]; then
+        INSTALLED=$(unit_value 'Environment=SMTPVOID_DATA_DIR=')
+        [ -z "$INSTALLED" ] || DATA_DIR=$INSTALLED
+    fi
+    if [ "$HTTP_ADDR_SET" -eq 0 ]; then
+        INSTALLED=$(unit_value 'Environment=SMTPVOID_HTTP_ADDR=')
+        [ -z "$INSTALLED" ] || HTTP_ADDR=$INSTALLED
+    fi
+    say "Keeping the installed layout: user $SERVICE_USER, data $DATA_DIR, web $HTTP_ADDR"
+fi
+
 sed -e "s|^User=.*|User=$SERVICE_USER|" \
     -e "s|^Group=.*|Group=$SERVICE_USER|" \
     -e "s|^ExecStart=.*|ExecStart=$TARGET_BINARY|" \
