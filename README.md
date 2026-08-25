@@ -142,13 +142,34 @@ works too.
 
 The issued certificate is written to `data/tls/` and swapped in live: STARTTLS,
 SMTPS and the HTTPS UI pick it up on their next connection, with no restart and
-no dropped sessions. Renewal is checked every six hours and runs once fewer than
-30 days remain (configurable). The settings page shows the current certificate,
-its expiry and the result of the last order.
+no dropped sessions. The settings page shows the current certificate, its expiry
+and the result of the last order.
+
+Renewal is checked every six hours (sooner after a failure, backing off from 15
+minutes towards six hours) and runs when the certificate is missing, does not
+cover every configured domain, came from a different ACME environment than the
+one configured, or has less life left than the renewal window. That window is
+the configured number of days, capped at a third of the certificate's own
+lifetime — a six-day certificate is not permanently inside a thirty-day window.
+
+Ordering itself is rate-limit aware, because the CA's limit is invisible from
+here and hitting it locks the domain out for days:
+
+- Let's Encrypt issues at most **5 certificates per week per exact set of
+  domains**. SMTPVoid keeps its own record in `data/acme/issued.json` and stops
+  at four, leaving one for an emergency.
+- After a successful issuance, ordering is held for 24 hours (1 hour if the
+  admin presses *Request / renew certificate now*). A held order is not an
+  error; the certificate panel shows why and until when.
+- Staging is not capped: it allows thousands a week.
 
 Use the **staging** directory while you get DNS and firewall rules right —
 production has strict rate limits and staging issues untrusted certificates that
-are otherwise identical.
+are otherwise identical. Switching back to production replaces the staging
+certificate automatically; the panel marks a staging certificate as untrusted.
+
+Watch out for *Regenerate self-signed* on a working deployment: it replaces the
+live certificate, so the next check has to order a new one.
 
 ## Deployment (Linux)
 

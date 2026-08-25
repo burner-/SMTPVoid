@@ -22,6 +22,10 @@ use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 pub enum CertSource {
     SelfSigned,
     Acme,
+    /// From an ACME staging environment: a real order, but signed by a CA
+    /// nobody trusts. Kept apart from [`CertSource::Acme`] so switching the
+    /// directory to production is seen as needing a new certificate.
+    AcmeStaging,
     /// Dropped in by the operator (or an unrecognised issuer).
     External,
 }
@@ -31,6 +35,7 @@ impl CertSource {
         match self {
             CertSource::SelfSigned => "self-signed",
             CertSource::Acme => "Let's Encrypt / ACME",
+            CertSource::AcmeStaging => "ACME staging (untrusted)",
             CertSource::External => "external",
         }
     }
@@ -48,6 +53,13 @@ pub struct CertInfo {
 }
 
 impl CertInfo {
+    /// How long this certificate was issued for. Let's Encrypt has offered
+    /// six-day certificates alongside the classic ninety-day ones since 2025,
+    /// so nothing may assume a lifetime.
+    pub fn lifetime_secs(&self) -> i64 {
+        (self.not_after - self.not_before).max(0)
+    }
+
     /// Whether this certificate covers every one of `wanted`.
     pub fn covers(&self, wanted: &[String]) -> bool {
         wanted.iter().all(|w| {
@@ -252,14 +264,18 @@ fn inspect(certs: &[CertificateDer<'static>]) -> Result<CertInfo> {
         .to_string();
 
     let self_signed = parsed.subject() == parsed.issuer();
+    let staging = issuer.contains("(STAGING)")
+        || issuer.contains("Pretend Pear")
+        || issuer.contains("Fake LE")
+        || issuer.contains("False Fennel")
+        || issuer.contains("Wannabe Watercress");
     let source = if self_signed {
         CertSource::SelfSigned
+    } else if staging {
+        CertSource::AcmeStaging
     } else if issuer.contains("Let's Encrypt")
         || issuer.starts_with('E') && issuer.len() <= 3
         || issuer.starts_with('R') && issuer.len() <= 3
-        || issuer.contains("(STAGING)")
-        || issuer.contains("Pretend Pear")
-        || issuer.contains("Fake LE")
     {
         CertSource::Acme
     } else {

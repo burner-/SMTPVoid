@@ -665,6 +665,11 @@ fn tls_panel(settings: &Settings, cert: Option<CertInfo>, acme: &AcmeStatus) -> 
                     r#"<div class="warn">This is a self-signed certificate. Mail clients will refuse it or warn loudly. Configure Let's Encrypt below for a publicly trusted one.</div>"#,
                 );
             }
+            if info.source == CertSource::AcmeStaging {
+                out.push_str(
+                    r#"<div class="warn">This certificate came from the Let's Encrypt <strong>staging</strong> environment: a real order, but signed by a CA nobody trusts. Switch the directory below to production and save - the certificate is then replaced automatically.</div>"#,
+                );
+            }
         }
         None => out.push_str(r#"<p class="muted">No certificate loaded.</p>"#),
     }
@@ -689,6 +694,12 @@ fn tls_panel(settings: &Settings, cert: Option<CertInfo>, acme: &AcmeStatus) -> 
                 esc(e)
             ));
         }
+        if let Some(h) = &acme.hold {
+            rows.push_str(&format!(
+                r#"<dt>On hold</dt><dd style="color:var(--amber)">{}</dd>"#,
+                esc(h)
+            ));
+        }
         if rows.is_empty() {
             rows.push_str(r#"<dt>Status</dt><dd class="muted">no order attempted yet</dd>"#);
         }
@@ -701,7 +712,9 @@ fn tls_panel(settings: &Settings, cert: Option<CertInfo>, acme: &AcmeStatus) -> 
         r#"<div class="stack" style="margin-top:16px">
 <form method="post" action="/admin/tls/renew"><button class="primary">Request / renew certificate now</button></form>
 <form method="post" action="/admin/tls/self-signed" onsubmit="return confirm('Replace the current certificate with a freshly generated self-signed one?')"><button>Regenerate self-signed</button></form>
-</div></div>"#,
+</div>
+<p class="muted small" style="margin-bottom:0">Let's Encrypt issues at most five certificates per week for the same set of domains, so an order is withheld if one was issued in the last hour or the week's fourth has already been used. Regenerating a self-signed certificate over a working one costs an order too, since the next check has to replace it.</p>
+</div>"#,
     );
     out
 }
