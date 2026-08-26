@@ -138,6 +138,14 @@ fn new_api_token() -> String {
 }
 
 fn valid_username(s: &str) -> bool {
+    if let Some((local, domain)) = s.split_once('@') {
+        return s.len() <= 254
+            && !local.is_empty()
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+            && s.chars().all(|c| !c.is_whitespace());
+    }
     (3..=32).contains(&s.len())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
@@ -243,7 +251,7 @@ async fn register(
     if !valid_username(&username) {
         return redirect_err(
             "/register",
-            "Username must be 3-32 characters: letters, digits, _ or -",
+            "Username must be 3-32 characters (letters, digits, _ or -) or an email address",
         );
     }
     if form.password.len() < 8 || form.password.len() > 128 {
@@ -575,7 +583,10 @@ async fn setup_submit(State(state): State<Arc<AppState>>, Form(form): Form<Setup
     }
     let username = form.username.trim().to_string();
     if !valid_username(&username) {
-        return redirect_err("/setup", "Username must be 3-32 characters: letters, digits, _ or -");
+        return redirect_err(
+            "/setup",
+            "Username must be 3-32 characters (letters, digits, _ or -) or an email address",
+        );
     }
     if form.password.len() < 8 || form.password.len() > 128 {
         return redirect_err("/setup", "Password must be 8-128 characters");
@@ -857,5 +868,29 @@ async fn tls_self_signed(State(state): State<Arc<AppState>>, headers: HeaderMap)
             tracing::error!("self-signed certificate generation failed: {e:#}");
             redirect_err("/admin/settings", "Could not generate a self-signed certificate")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_username;
+
+    #[test]
+    fn accepts_plain_usernames() {
+        assert!(valid_username("alice"));
+        assert!(valid_username("alice_92-1"));
+        assert!(!valid_username("ab"));
+        assert!(!valid_username("has a space"));
+    }
+
+    #[test]
+    fn accepts_email_addresses() {
+        assert!(valid_username("alice@example.com"));
+        assert!(valid_username("a@b.co"));
+        assert!(!valid_username("@example.com"));
+        assert!(!valid_username("alice@localhost"));
+        assert!(!valid_username("alice@.com"));
+        assert!(!valid_username("alice@example."));
+        assert!(!valid_username("alice with space@example.com"));
     }
 }

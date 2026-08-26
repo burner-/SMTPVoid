@@ -338,7 +338,7 @@ pub fn auth_page(title: &str, action: &str, submit: &str, extra_field: &str) -> 
 <form method="post" action="{action}">
 {extra_field}
 <label for="username">Username</label>
-<input type="text" id="username" name="username" required maxlength="32" autocomplete="username">
+<input type="text" id="username" name="username" required maxlength="254" autocomplete="username">
 <label for="password">Password</label>
 <input type="password" id="password" name="password" required minlength="8" maxlength="128" autocomplete="current-password">
 <button class="primary" type="submit">{submit}</button>
@@ -753,7 +753,7 @@ pub fn setup_page() -> String {
 <label for="token">Setup token</label>
 <input type="text" id="token" name="token" required autocomplete="off">
 <label for="username">Admin username</label>
-<input type="text" id="username" name="username" required maxlength="32">
+<input type="text" id="username" name="username" required maxlength="254">
 <label for="password">Password</label>
 <input type="password" id="password" name="password" required minlength="8" maxlength="128" autocomplete="new-password">
 <button class="primary" type="submit">Create admin account</button>
